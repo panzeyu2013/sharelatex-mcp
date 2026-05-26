@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sharelatex-mcp"
+version = "0.1.0"
+description = "A Python MCP server for self-hosted ShareLaTeX / Overleaf instances"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["mcp", "overleaf", "sharelatex", "latex", "self-hosted"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "mcp>=1.9.4",
+  "python-dotenv>=1.0.1",
+  "requests>=2.32.3",
+  "websocket-client>=1.9.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "mypy>=1.15",
+  "pytest>=8",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.11",
+]
+
+[project.scripts]
+sharelatex-mcp = "sharelatex_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["sharelatex_mcp*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "I",
+  "N",
+  "UP",
+  "B",
+  "C4",
+  "SIM",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sharelatex_mcp"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["scripts"]
+pythonpath = ["."]
