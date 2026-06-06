@@ -111,6 +111,11 @@ def _build_compile_fix_hint(kind: str, message: str) -> str | None:
             "Check that the font package, compilation engine, and font name are compatible, "
             "especially when using XeLaTeX or LuaLaTeX."
         )
+    if kind == "package-warning":
+        return (
+            "Check the package documentation and verify that the package arguments, "
+            "version, and engine compatibility are correct for the reported warning."
+        )
     if "rerun" in message.lower():
         return "This is a standard two-pass compilation hint — usually resolved by compiling once more."
     return None
@@ -175,7 +180,7 @@ class ProjectClient:
         params: dict[str, str] | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> HttpResult:
-        result = None
+        result: HttpResult | None = None
         for force_refresh in (False, True):
             csrf_token = self.session_manager.get_csrf_token(
                 project_id=project_id, force_refresh=force_refresh,
@@ -194,6 +199,7 @@ class ProjectClient:
             )
             if result.status_code != 403:
                 return result
+        assert result is not None
         return result
 
     def _delete_with_csrf(

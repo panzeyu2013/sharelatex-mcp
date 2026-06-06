@@ -47,13 +47,13 @@ class HttpClient:
         self.session.close()
         logger.debug("HttpClient session closed")
 
-    def get(self, path: str, **kwargs: Any) -> HttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("GET %s", url)
+    def _build_url(self, path: str) -> str:
+        return urljoin(self.base_url, path.lstrip("/"))
+
+    def _request_text(self, method: str, url: str, **kwargs: Any) -> HttpResult:
+        logger.debug("%s %s", method.upper(), url)
         try:
-            response = self.session.get(
-                url, timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
-            )
+            response = self.session.request(method, url, **kwargs)
         except requests.RequestException as exc:
             raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
         return HttpResult(
@@ -61,51 +61,43 @@ class HttpClient:
             headers=response.headers,
             text=response.text,
             url=response.url,
+        )
+
+    def _request_bytes(self, method: str, url: str, **kwargs: Any) -> BinaryHttpResult:
+        logger.debug("%s(bytes) %s", method.upper(), url)
+        try:
+            response = self.session.request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
+        return BinaryHttpResult(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=response.content,
+            url=response.url,
+        )
+
+    def get(self, path: str, **kwargs: Any) -> HttpResult:
+        return self._request_text(
+            "GET", self._build_url(path),
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def get_absolute(self, absolute_url: str, **kwargs: Any) -> HttpResult:
-        logger.debug("GET(absolute) %s", absolute_url)
-        try:
-            response = self.session.get(absolute_url, timeout=self.timeout_seconds, **kwargs)
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return HttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            text=response.text,
-            url=response.url,
+        return self._request_text(
+            "GET", absolute_url,
+            timeout=self.timeout_seconds, **kwargs,
         )
 
     def post_form(self, path: str, data: dict[str, str], **kwargs: Any) -> HttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("POST(form) %s", url)
-        try:
-            response = self.session.post(
-                url, data=data, timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return HttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            text=response.text,
-            url=response.url,
+        return self._request_text(
+            "POST", self._build_url(path), data=data,
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def post_json(self, path: str, payload: dict[str, Any], **kwargs: Any) -> HttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("POST(json) %s", url)
-        try:
-            response = self.session.post(
-                url, json=payload, timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return HttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            text=response.text,
-            url=response.url,
+        return self._request_text(
+            "POST", self._build_url(path), json=payload,
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def post_multipart(
@@ -115,63 +107,25 @@ class HttpClient:
         data: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> HttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("POST(multipart) %s", url)
-        try:
-            response = self.session.post(
-                url, files=files, data=data, timeout=self.timeout_seconds,
-                allow_redirects=False, **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return HttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            text=response.text,
-            url=response.url,
+        return self._request_text(
+            "POST", self._build_url(path), files=files, data=data,
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def delete(self, path: str, **kwargs: Any) -> HttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("DELETE %s", url)
-        try:
-            response = self.session.delete(
-                url, timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return HttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            text=response.text,
-            url=response.url,
+        return self._request_text(
+            "DELETE", self._build_url(path),
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def get_bytes(self, path: str, **kwargs: Any) -> BinaryHttpResult:
-        url = urljoin(self.base_url, path.lstrip("/"))
-        logger.debug("GET(bytes) %s", url)
-        try:
-            response = self.session.get(
-                url, timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return BinaryHttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            content=response.content,
-            url=response.url,
+        return self._request_bytes(
+            "GET", self._build_url(path),
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def get_bytes_absolute(self, absolute_url: str, **kwargs: Any) -> BinaryHttpResult:
-        logger.debug("GET(bytes, absolute) %s", absolute_url)
-        try:
-            response = self.session.get(absolute_url, timeout=self.timeout_seconds, **kwargs)
-        except requests.RequestException as exc:
-            raise _wrap_network_error(self.base_url, self.timeout_seconds, exc) from exc
-        return BinaryHttpResult(
-            status_code=response.status_code,
-            headers=response.headers,
-            content=response.content,
-            url=response.url,
+        return self._request_bytes(
+            "GET", absolute_url,
+            timeout=self.timeout_seconds, **kwargs,
         )

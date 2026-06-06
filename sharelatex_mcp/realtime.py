@@ -80,7 +80,7 @@ class LegacySocketConnection:
             ws_url,
             header=[
                 f"Cookie: {cookie_header}",
-                f"Origin: {self.config.base_url}",
+                f"Origin: {parsed.scheme}://{parsed.netloc}",
             ],
             timeout=self.config.timeout_seconds,
         )
@@ -102,6 +102,8 @@ class LegacySocketConnection:
         while True:
             try:
                 message = self.ws.recv()
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", errors="replace")
             except websocket.WebSocketConnectionClosedException as exc:
                 raise RuntimeError(
                     f"WebSocket connection closed unexpectedly for project {self.project_id}"
