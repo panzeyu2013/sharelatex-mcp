@@ -137,7 +137,7 @@ cp .env.example .env
 OVERLEAF_BASE_URL=http://your-overleaf-host:2233
 OVERLEAF_EMAIL=your-email@example.com
 OVERLEAF_PASSWORD=your-password
-OVERLEAF_TIMEOUT_MS=15
+OVERLEAF_TIMEOUT_SECONDS=15
 OVERLEAF_ALLOW_INSECURE_HTTP=true
 LOG_LEVEL=INFO
 ```
@@ -149,7 +149,7 @@ LOG_LEVEL=INFO
 | `OVERLEAF_BASE_URL` | 是 | 你的自部署 ShareLaTeX / Overleaf 基础地址 |
 | `OVERLEAF_EMAIL` | 是 | 登录邮箱 |
 | `OVERLEAF_PASSWORD` | 是 | 登录密码 |
-| `OVERLEAF_TIMEOUT_MS` | 否 | HTTP 超时秒数，默认 `15` |
+| `OVERLEAF_TIMEOUT_SECONDS` | 否 | HTTP 超时秒数，默认 `15` |
 | `OVERLEAF_ALLOW_INSECURE_HTTP` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
 | `LOG_LEVEL` | 否 | MCP 服务日志级别，默认 `INFO` |
 
@@ -189,7 +189,7 @@ uv run sharelatex-mcp
         "OVERLEAF_BASE_URL": "http://your-overleaf-host:2233",
         "OVERLEAF_EMAIL": "your-email@example.com",
         "OVERLEAF_PASSWORD": "your-password",
-        "OVERLEAF_TIMEOUT_MS": "15",
+        "OVERLEAF_TIMEOUT_SECONDS": "15",
         "OVERLEAF_ALLOW_INSECURE_HTTP": "true",
         "LOG_LEVEL": "INFO"
       }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import html
 import json
 import logging
@@ -15,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from websocket import WebSocketConnectionClosedException
 
+from sharelatex_mcp.http import HttpResult
 from sharelatex_mcp.realtime import RealtimeProjectClient
 from sharelatex_mcp.session import OverleafSessionManager
 
@@ -118,14 +120,17 @@ class ProjectClient:
     def __init__(self, session_manager: OverleafSessionManager) -> None:
         self.session_manager = session_manager
         self.realtime_client = RealtimeProjectClient(session_manager.config, session_manager)
-        self._compile_cache: dict[str, tuple[float, dict[str, object]]] = {}
+        self._compile_cache: dict[str, tuple[float, dict[str, object], tuple[object, ...]]] = {}
         self._entity_cache: dict[str, dict[str, ProjectEntity]] = {}
         self._entity_id_index: dict[str, dict[str, str]] = {}
+        self._tree_cache: dict[str, dict[str, Any]] = {}
 
-    def _invalidate_compile_cache(self, project_id: str) -> None:
-        if project_id in self._compile_cache:
-            del self._compile_cache[project_id]
-            logger.debug("Invalidated compile cache for project %s", project_id)
+    def close(self) -> None:
+        self.session_manager.close()
+
+    def _invalidate_caches(self, project_id: str) -> None:
+        self._compile_cache.pop(project_id, None)
+        self._tree_cache.pop(project_id, None)
 
     def _request_with_csrf_retry(
         self,
@@ -152,7 +157,7 @@ class ProjectClient:
         path: str,
         payload: dict[str, object],
         extra_headers: dict[str, str] | None = None,
-    ):
+    ) -> HttpResult:
         return self._request_with_csrf_retry(
             project_id=project_id,
             request_fn=lambda headers: self.session_manager.http.post_json(
@@ -169,7 +174,7 @@ class ProjectClient:
         data: dict[str, object] | None = None,
         params: dict[str, str] | None = None,
         extra_headers: dict[str, str] | None = None,
-    ):
+    ) -> HttpResult:
         result = None
         for force_refresh in (False, True):
             csrf_token = self.session_manager.get_csrf_token(
@@ -196,7 +201,7 @@ class ProjectClient:
         project_id: str,
         path: str,
         extra_headers: dict[str, str] | None = None,
-    ):
+    ) -> HttpResult:
         return self._request_with_csrf_retry(
             project_id=project_id,
             request_fn=lambda headers: self.session_manager.http.delete(
@@ -276,8 +281,15 @@ class ProjectClient:
         self._entity_id_index[project_id] = id_index
 
     def _cache_upsert(self, project_id: str, entity: ProjectEntity) -> None:
-        self._entity_cache.setdefault(project_id, {})[entity.path] = entity
+        project_cache = self._entity_cache.setdefault(project_id, {})
+        existing = project_cache.get(entity.path)
         index = self._entity_id_index.setdefault(project_id, {})
+        if existing is not None and existing.entity_id != entity.entity_id:
+            if existing.entity_id and existing.entity_id in index:
+                del index[existing.entity_id]
+            if existing.hash and existing.hash in index:
+                del index[existing.hash]
+        project_cache[entity.path] = entity
         if entity.entity_id:
             index[entity.entity_id] = entity.path
         if entity.hash:
@@ -299,8 +311,10 @@ class ProjectClient:
         idx = self._entity_id_index.get(project_id, {})
         path = idx.get(entity_id)
         if path is not None:
-            self._entity_cache.get(project_id, {}).pop(path, None)
+            entity = self._entity_cache.get(project_id, {}).pop(path, None)
             del idx[entity_id]
+            if entity is not None and entity.hash and entity.hash in idx:
+                del idx[entity.hash]
 
     def _resolve_entity_by_path(self, project_id: str, path: str) -> ProjectEntity:
         cached = self._get_cached_entity(project_id, path)
@@ -399,7 +413,11 @@ class ProjectClient:
         if result.status_code != 200:
             raise RuntimeError(f"Failed to read project file tree, status code: {result.status_code}")
 
-        payload = json.loads(result.text)
+        try:
+            payload = json.loads(result.text)
+        except json.JSONDecodeError as err:
+            raise RuntimeError("Failed to parse project file tree: invalid JSON response") from err
+
         entities = payload.get("entities", [])
         return [
             ProjectEntity(
@@ -411,16 +429,20 @@ class ProjectClient:
         ]
 
     def get_project_tree(self, project_id: str) -> dict[str, Any]:
+        if project_id in self._tree_cache:
+            return self._tree_cache[project_id]
+
         attempts = 3
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
                 joined = self.realtime_client.join_project(project_id)
+                self._tree_cache[project_id] = joined.project
                 return joined.project
-            except WebSocketConnectionClosedException as exc:
+            except (WebSocketConnectionClosedException, RuntimeError) as exc:
                 last_error = exc
                 logger.warning(
-                    "WebSocket connection closed (attempt %d/%d) for project %s: %s",
+                    "WebSocket failure (attempt %d/%d) for project %s: %s",
                     attempt, attempts, project_id, exc,
                 )
                 if attempt == attempts:
@@ -430,7 +452,9 @@ class ProjectClient:
             raise RuntimeError(
                 f"Failed to read project tree: websocket connection closed after {attempts} retries"
             ) from last_error
-        raise RuntimeError("Failed to read project tree")
+        raise RuntimeError(
+            f"Failed to read project tree: no valid response after {attempts} attempts"
+        )
 
     def get_root_doc(self, project_id: str) -> dict[str, str | None]:
         project = self.get_project_tree(project_id)
@@ -468,6 +492,7 @@ class ProjectClient:
         if result.status_code >= 400:
             raise RuntimeError(f"Failed to set root doc, status code: {result.status_code}")
 
+        self._invalidate_caches(project_id)
         current = self.get_root_doc(project_id)
         return {
             "ok": True,
@@ -508,7 +533,11 @@ class ProjectClient:
         if result.status_code >= 400:
             raise RuntimeError(f"Failed to create folder, status code: {result.status_code}")
 
-        payload = json.loads(result.text)
+        try:
+            payload = json.loads(result.text)
+        except json.JSONDecodeError as err:
+            raise RuntimeError("Failed to create folder: invalid JSON response") from err
+
         entity_id = payload.get("_id")
         if not entity_id:
             raise RuntimeError("Folder created but no folder ID returned")
@@ -523,6 +552,7 @@ class ProjectClient:
                 parent_folder_id=target_folder_id,
             ),
         )
+        self._invalidate_caches(project_id)
         return {
             "project_id": project_id,
             "entity_id": entity_id,
@@ -553,7 +583,11 @@ class ProjectClient:
         if result.status_code >= 400:
             raise RuntimeError(f"Failed to create document, status code: {result.status_code}")
 
-        payload = json.loads(result.text)
+        try:
+            payload = json.loads(result.text)
+        except json.JSONDecodeError as err:
+            raise RuntimeError("Failed to create document: invalid JSON response") from err
+
         entity_id = payload.get("_id")
         if not entity_id:
             raise RuntimeError("Document created but no document ID returned")
@@ -568,6 +602,7 @@ class ProjectClient:
                 parent_folder_id=target_folder_id,
             ),
         )
+        self._invalidate_caches(project_id)
         return {
             "project_id": project_id,
             "entity_id": entity_id,
@@ -590,19 +625,24 @@ class ProjectClient:
     ) -> dict[str, object]:
         cached = self._compile_cache.get(project_id)
         now = time.time()
+        params_key = (draft, check, stop_on_first_error, allow_compat_variants)
         if not force and cached is not None:
-            cached_at, cached_payload = cached
-            cached_status = cached_payload.get("status")
-            cooldown_seconds = self._compile_backoff_seconds(cached_status, min_interval_seconds)
-            if cached_status in {"too-recently-compiled", "compile-in-progress"} and now - cached_at < cooldown_seconds:
-                reused: dict[str, object] = dict(cached_payload)
-                reused["cached"] = True
-                reused["cache_age_seconds"] = round(now - cached_at, 3)
-                reused["local_skip_reason"] = "recent_compile_cooldown"
-                reused["cooldown_seconds"] = cooldown_seconds
-                if return_attempt_trace and "attempt_trace" not in reused:
-                    reused["attempt_trace"] = []
-                return reused
+            cached_at, cached_payload, cached_params = cached
+            if cached_params != params_key:
+                logger.debug("Compile cache params mismatch, ignoring cache")
+            else:
+                cached_status = cached_payload.get("status")
+                cooldown_seconds = self._compile_backoff_seconds(cached_status, min_interval_seconds)
+                cooldown_status = {"too-recently-compiled", "compile-in-progress"}
+                if cached_status in cooldown_status and now - cached_at < cooldown_seconds:
+                    reused: dict[str, object] = dict(cached_payload)
+                    reused["cached"] = True
+                    reused["cache_age_seconds"] = round(now - cached_at, 3)
+                    reused["local_skip_reason"] = "recent_compile_cooldown"
+                    reused["cooldown_seconds"] = cooldown_seconds
+                    if return_attempt_trace and "attempt_trace" not in reused:
+                        reused["attempt_trace"] = []
+                    return reused
 
         project = self.get_project_tree(project_id)
         resolved_root_doc_id = root_doc_id or project.get("rootDoc_id")
@@ -655,7 +695,7 @@ class ProjectClient:
                 if result.status_code == 200:
                     selected_variant_label = variant_label
                     break
-                if result.status_code == 500 and attempt < attempts:
+                if result.status_code >= 500 and attempt < attempts:
                     logger.warning(
                         "Compile attempt %d returned 500, retrying after %.1fs",
                         attempts_made, retry_delay_seconds,
@@ -664,6 +704,18 @@ class ProjectClient:
                     continue
                 break
             if result is not None and result.status_code == 200:
+                if allow_compat_variants:
+                    try:
+                        response_status = json.loads(result.text).get("status")
+                    except json.JSONDecodeError:
+                        response_status = None
+                    if response_status not in ("success",):
+                        selected_variant_label = selected_variant_label if selected_variant_label else variant_label
+                        logger.info(
+                            "HTTP 200 with status=%s, trying compat variant next",
+                            response_status,
+                        )
+                        continue
                 break
 
         if result is None:
@@ -704,7 +756,7 @@ class ProjectClient:
         payload["selected_variant"] = selected_variant_label
         if return_attempt_trace:
             payload["attempt_trace"] = attempt_trace
-        self._compile_cache[project_id] = (time.time(), dict(payload))
+        self._compile_cache[project_id] = (time.time(), copy.deepcopy(payload), params_key)
         return payload
 
     def stop_compile(self, project_id: str) -> dict[str, object]:
@@ -715,6 +767,7 @@ class ProjectClient:
             payload={},
             extra_headers={"Accept": "application/json"},
         )
+        self._invalidate_caches(project_id)
         response: dict[str, object] = {
             "ok": result.status_code == 200,
             "project_id": project_id,
@@ -733,6 +786,7 @@ class ProjectClient:
             path=f"/project/{project_id}/output",
             extra_headers={"Accept": "application/json"},
         )
+        self._invalidate_caches(project_id)
         response: dict[str, object] = {
             "ok": result.status_code == 200,
             "project_id": project_id,
@@ -799,14 +853,24 @@ class ProjectClient:
         }
 
         if isinstance(log_file, dict):
-            result["output_log"] = self._fetch_output_file_text(log_file, max_bytes=max_bytes)
+            try:
+                result["output_log"] = self._fetch_output_file_text(log_file, max_bytes=max_bytes)
+            except Exception as exc:
+                logger.warning("Failed to fetch output.log: %s", exc)
+                result["output_log"] = f"<error reading output.log: {exc}>"
 
         bib_log_payloads: list[dict[str, object | str | None]] = []
         for item in bib_logs:
+            content: str | None
+            try:
+                content = self._fetch_output_file_text(item, max_bytes=max_bytes)
+            except Exception as exc:
+                logger.warning("Failed to fetch bib log %s: %s", item.get("path"), exc)
+                content = f"<error reading {item.get('path')}: {exc}>"
             bib_log_payloads.append(
                 {
                     "path": item.get("path"),
-                    "content": self._fetch_output_file_text(item, max_bytes=max_bytes),
+                    "content": content,
                 }
             )
         result["bib_logs"] = bib_log_payloads
@@ -903,11 +967,16 @@ class ProjectClient:
         for item in output_files:
             if not isinstance(item, dict):
                 continue
+            try:
+                resolved_url = self._resolve_output_file_url(item)
+            except RuntimeError as exc:
+                logger.warning("Failed to resolve artifact URL for %s: %s", item.get("path"), exc)
+                resolved_url = None
             artifact: dict[str, object | str | None] = {
                 "path": item.get("path"),
                 "type": item.get("type"),
                 "build": item.get("build"),
-                "resolved_url": self._resolve_output_file_url(item),
+                "resolved_url": resolved_url,
             }
             artifacts.append(artifact)
             if item.get("path") == "output.pdf":
@@ -959,16 +1028,26 @@ class ProjectClient:
                 "artifacts_result": artifacts,
             }
 
-        parsed = urlparse(resolved_url)
-        binary_result = self.session_manager.http.get_bytes(
-            parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        )
+        binary_result = self.session_manager.http.get_bytes_absolute(resolved_url)
         if binary_result.status_code != 200:
             return {
                 "ok": False,
                 "project_id": project_id,
                 "message": "Failed to download PDF.",
                 "status_code": binary_result.status_code,
+                "resolved_url": resolved_url,
+            }
+
+        content_type = binary_result.headers.get("Content-Type", "").lower()
+        if "text/html" in content_type:
+            return {
+                "ok": False,
+                "project_id": project_id,
+                "message": (
+                    "Download returned HTML instead of PDF — "
+                    "the session may have expired or the compile output is no longer accessible."
+                ),
+                "content_type": content_type,
                 "resolved_url": resolved_url,
             }
 
@@ -1138,7 +1217,13 @@ class ProjectClient:
                 message = f"{message} error={response_payload['error']}"
             raise RuntimeError(f"{message} status code: {result.status_code}")
 
-        self._invalidate_compile_cache(project_id)
+        if not 200 <= result.status_code < 300:
+            raise RuntimeError(
+                f"Upload returned unexpected status code {result.status_code}. "
+                f"The session may have expired (redirect to login)."
+            )
+
+        self._invalidate_caches(project_id)
         uploaded_path = f"{normalized_folder_path}/{upload_name}" if normalized_folder_path else f"/{upload_name}"
         uploaded_entity: ProjectEntity | None = None
         retry_delays = [0.5, 1.0, 2.0, 3.0, 5.0, 5.0, 5.0, 5.0]
@@ -1240,7 +1325,7 @@ class ProjectClient:
             delete_backup_error = str(exc)
             logger.warning("Failed to delete backup file %s: %s", backup_path, exc)
 
-        self._invalidate_compile_cache(project_id)
+        self._invalidate_caches(project_id)
         replaced_entity = self._resolve_entity_by_path(
             project_id=project_id,
             path=f"{parent_path}/{final_name}" if parent_path else f"/{final_name}",
@@ -1280,22 +1365,17 @@ class ProjectClient:
             }
 
         logger.info("Writing to %s in project %s (%d chars)", path, project_id, len(content))
-        joined_doc = self.realtime_client.join_doc(project_id, target.entity_id)
-        current_from_socket = "\n".join(joined_doc.snapshot_lines)
-
-        delete_base = current_from_socket if current_from_socket == current else current
 
         operations = [
-            {"p": 0, "d": delete_base},
+            {"p": 0, "d": current},
             {"p": 0, "i": content},
         ]
-        self.realtime_client.apply_text_operation(
+        self.realtime_client.join_doc_and_apply_ot(
             project_id=project_id,
             doc_id=target.entity_id,
-            version=joined_doc.version,
             operations=operations,
         )
-        self._invalidate_compile_cache(project_id)
+        self._invalidate_caches(project_id)
         logger.debug("Write operation sent for %s in project %s", path, project_id)
         return {
             "project_id": project_id,
@@ -1314,7 +1394,7 @@ class ProjectClient:
         if result.status_code >= 400:
             raise RuntimeError(f"Failed to delete entity, status code: {result.status_code}")
         self._cache_delete_by_entity_id(project_id, entity_id)
-        self._invalidate_compile_cache(project_id)
+        self._invalidate_caches(project_id)
         return {
             "project_id": project_id,
             "entity_id": entity_id,
@@ -1353,7 +1433,7 @@ class ProjectClient:
                 hash=target.hash,
             ),
         )
-        self._invalidate_compile_cache(project_id)
+        self._invalidate_caches(project_id)
         return {
             "project_id": project_id,
             "entity_id": target.entity_id,
@@ -1395,7 +1475,7 @@ class ProjectClient:
                 hash=target.hash,
             ),
         )
-        self._invalidate_compile_cache(project_id)
+        self._invalidate_caches(project_id)
         return {
             "project_id": project_id,
             "entity_id": target.entity_id,
@@ -1416,19 +1496,27 @@ class ProjectClient:
             folder_path = parent_path
             current_folder_id = folder.get("_id")
         else:
-            folder_path = f"{parent_path}/{folder['name']}" if parent_path else f"/{folder['name']}"
-            current_folder_id = folder.get("_id")
-            output.append(
-                ProjectEntity(
-                    path=folder_path,
-                    type="folder",
-                    entity_id=current_folder_id,
-                    parent_folder_id=parent_folder_id,
+            folder_name = folder.get("name", "")
+            if not folder_name:
+                folder_path = parent_path
+                current_folder_id = folder.get("_id")
+            else:
+                folder_path = f"{parent_path}/{folder_name}" if parent_path else f"/{folder_name}"
+                current_folder_id = folder.get("_id")
+                output.append(
+                    ProjectEntity(
+                        path=folder_path,
+                        type="folder",
+                        entity_id=current_folder_id,
+                        parent_folder_id=parent_folder_id,
+                    )
                 )
-            )
 
         for doc in folder.get("docs", []):
-            doc_path = f"{folder_path}/{doc['name']}" if folder_path else f"/{doc['name']}"
+            doc_name = doc.get("name")
+            if not doc_name:
+                continue
+            doc_path = f"{folder_path}/{doc_name}" if folder_path else f"/{doc_name}"
             output.append(
                 ProjectEntity(
                     path=doc_path,
@@ -1439,7 +1527,10 @@ class ProjectClient:
             )
 
         for file_ref in folder.get("fileRefs", []):
-            file_path = f"{folder_path}/{file_ref['name']}" if folder_path else f"/{file_ref['name']}"
+            file_name = file_ref.get("name")
+            if not file_name:
+                continue
+            file_path = f"{folder_path}/{file_name}" if folder_path else f"/{file_name}"
             output.append(
                 ProjectEntity(
                     path=file_path,
@@ -1492,29 +1583,13 @@ class ProjectClient:
 
     def _fetch_output_file_text(self, output_file: dict[str, Any], max_bytes: int) -> str:
         file_url = self._resolve_output_file_url(output_file)
-        parsed = urlparse(file_url)
-        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         logger.debug("Fetching output file %s (max %d bytes)", file_url, max_bytes)
-        result = self.session_manager.http.get(path, stream=True)
+        result = self.session_manager.http.get_absolute(file_url)
         if result.status_code != 200:
-            raise RuntimeError(f"Failed to read compile output file, status code: {result.status_code}")
-        if result._response is None:
-            return result.text[:max_bytes]
-        chunks: list[str] = []
-        total = 0
-        for chunk in result._response.iter_content(chunk_size=8192, decode_unicode=True):
-            if not chunk:
-                continue
-            remaining = max_bytes - total
-            if remaining <= 0:
-                break
-            if len(chunk) > remaining:
-                chunks.append(chunk[:remaining])
-                total += remaining
-                break
-            chunks.append(str(chunk))
-            total += len(chunk)
-        return "".join(chunks)
+            raise RuntimeError(
+                f"Failed to read compile output file, status code: {result.status_code}"
+            )
+        return result.text[:max_bytes]
 
     def _resolve_output_file_url(self, output_file: dict[str, Any]) -> str:
         raw_url = output_file.get("url")

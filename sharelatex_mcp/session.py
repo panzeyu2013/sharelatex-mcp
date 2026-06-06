@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-import re
+
+import requests
+from bs4 import BeautifulSoup
 
 from sharelatex_mcp.config import AppConfig
 from sharelatex_mcp.http import HttpClient
@@ -10,13 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_csrf(html: str) -> str:
-    hidden_match = re.search(r'name="_csrf"\s+type="hidden"\s+value="([^"]+)"', html, flags=re.IGNORECASE)
-    if hidden_match:
-        return hidden_match.group(1)
+    soup = BeautifulSoup(html, "html.parser")
 
-    meta_match = re.search(r'<meta\s+name="ol-csrfToken"\s+content="([^"]+)"', html, flags=re.IGNORECASE)
-    if meta_match:
-        return meta_match.group(1)
+    hidden = soup.find("input", attrs={"name": "_csrf", "type": "hidden"})
+    if hidden and hidden.get("value"):
+        return str(hidden["value"])
+
+    meta = soup.find("meta", attrs={"name": "ol-csrfToken"})
+    if meta and meta.get("content"):
+        return str(meta["content"])
 
     raise RuntimeError("Unable to parse CSRF token from login page")
 
@@ -27,6 +31,9 @@ class OverleafSessionManager:
         self.http = HttpClient(config.base_url, config.timeout_seconds)
         self._csrf_token: str | None = None
 
+    def close(self) -> None:
+        self.http.close()
+
     def login(self) -> None:
         logger.info("Attempting login to %s", self.config.base_url)
         login_page = self.http.get("/login")
@@ -34,7 +41,6 @@ class OverleafSessionManager:
             raise RuntimeError(f"Failed to access login page, status code: {login_page.status_code}")
 
         csrf_token = _extract_csrf(login_page.text)
-        self._csrf_token = csrf_token
         logger.debug("Extracted CSRF token from login page")
 
         login_result = self.http.post_form(
@@ -55,6 +61,7 @@ class OverleafSessionManager:
         if "/login" in location:
             raise RuntimeError("Still redirected to login page after authentication")
 
+        self._csrf_token = csrf_token
         logger.info("Login successful")
 
     def ensure_logged_in(self) -> None:
@@ -65,7 +72,13 @@ class OverleafSessionManager:
             raise RuntimeError("No valid session established after login")
 
     def is_logged_in(self) -> bool:
-        home = self.http.get("/project")
+        try:
+            home = self.http.get("/project")
+        except (requests.ConnectionError, requests.Timeout, RuntimeError):
+            logger.debug("Network error checking login status", exc_info=True)
+            return False
+        if home.status_code >= 500:
+            return False
         location = home.headers.get("Location", "")
         return not (300 <= home.status_code < 400 and "/login" in location)
 

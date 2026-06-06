@@ -28,19 +28,27 @@ def _get_required(name: str) -> str:
 
 def _get_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
-    if value is None:
+    if value is None or value == "":
         return default
-    return value.strip().lower() == "true"
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes", "on"):
+        return True
+    if normalized in ("false", "0", "no", "off"):
+        return False
+    raise RuntimeError(f"Invalid boolean value for {name}: {value!r}")
 
 
-def _get_int(name: str, default: int) -> int:
+def _get_int(name: str, default: int, min_value: int = 1) -> int:
     value = os.getenv(name)
     if value is None or value == "":
         return default
     try:
-        return int(value)
+        result = int(value)
     except ValueError as exc:
         raise RuntimeError(f"Environment variable {name} is not a valid integer") from exc
+    if result < min_value:
+        raise RuntimeError(f"Environment variable {name} must be at least {min_value}")
+    return result
 
 
 def load_config() -> AppConfig:
@@ -69,11 +77,15 @@ def load_config() -> AppConfig:
         else:
             timeout_seconds = 15
 
+    raw_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    if raw_level not in valid_levels:
+        raise RuntimeError(f"Invalid LOG_LEVEL: {raw_level!r}. Must be one of {valid_levels}")
     return AppConfig(
         base_url=base_url,
         email=_get_required("OVERLEAF_EMAIL"),
         password=_get_required("OVERLEAF_PASSWORD"),
         timeout_seconds=timeout_seconds,
         allow_insecure_http=_get_bool("OVERLEAF_ALLOW_INSECURE_HTTP", False),
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_level=raw_level,
     )

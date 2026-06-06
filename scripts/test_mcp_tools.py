@@ -202,6 +202,7 @@ async def main() -> None:
     folder_b_payload = None
     doc_payload = None
     uploaded_file_payload = None
+    root_doc_temp_payload = None
 
     folder_a_result = await server.call_tool(
         "create_folder",
@@ -489,7 +490,7 @@ async def main() -> None:
             print("\ndelete_entity（doc）结果：")
             print(json.dumps(delete_doc_payload, ensure_ascii=False, indent=2))
 
-        if 'root_doc_temp_payload' in locals():
+        if root_doc_temp_payload is not None:
             delete_root_doc_result = await server.call_tool(
                 "delete_entity",
                 {

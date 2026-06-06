@@ -150,7 +150,7 @@ Edit `.env`:
 OVERLEAF_BASE_URL=http://your-overleaf-host:2233
 OVERLEAF_EMAIL=your-email@example.com
 OVERLEAF_PASSWORD=your-password
-OVERLEAF_TIMEOUT_MS=15
+OVERLEAF_TIMEOUT_SECONDS=15
 OVERLEAF_ALLOW_INSECURE_HTTP=true
 LOG_LEVEL=INFO
 ```
@@ -162,7 +162,7 @@ Environment variables:
 | `OVERLEAF_BASE_URL` | Yes | Base URL of your self-hosted ShareLaTeX / Overleaf instance |
 | `OVERLEAF_EMAIL` | Yes | Login email |
 | `OVERLEAF_PASSWORD` | Yes | Login password |
-| `OVERLEAF_TIMEOUT_MS` | No | HTTP timeout in seconds. Default: `15` |
+| `OVERLEAF_TIMEOUT_SECONDS` | No | HTTP timeout in seconds. Default: `15` |
 | `OVERLEAF_ALLOW_INSECURE_HTTP` | No | Set `true` if you are using plain `http://` in a trusted local network |
 | `LOG_LEVEL` | No | MCP server log level. Default: `INFO` |
 
@@ -202,7 +202,7 @@ Use a generic `stdio` MCP configuration like this and adapt it to your client:
         "OVERLEAF_BASE_URL": "http://your-overleaf-host:2233",
         "OVERLEAF_EMAIL": "your-email@example.com",
         "OVERLEAF_PASSWORD": "your-password",
-        "OVERLEAF_TIMEOUT_MS": "15",
+        "OVERLEAF_TIMEOUT_SECONDS": "15",
         "OVERLEAF_ALLOW_INSECURE_HTTP": "true",
         "LOG_LEVEL": "INFO"
       }
