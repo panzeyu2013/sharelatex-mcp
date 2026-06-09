@@ -1,12 +1,29 @@
 from __future__ import annotations
 
-import logging
-import os
+import json
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
-from dotenv import load_dotenv
+CONFIG_DIR = Path.home() / ".config" / "sharelatex-mcp"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
-logger = logging.getLogger(__name__)
+TEMPLATE = """\
+{
+  // Base URL of your self-hosted ShareLaTeX / Overleaf instance
+  "base_url": "http://your-overleaf-host:2233",
+  // Login email
+  "email": "your-email@example.com",
+  // Login password
+  "password": "your-password",
+  // HTTP request timeout in seconds (default: 15)
+  "timeout_seconds": 15,
+  // Set to true if you are using http:// instead of https://
+  "allow_insecure_http": false,
+  // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
+  "log_level": "INFO"
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -19,73 +36,72 @@ class AppConfig:
     log_level: str
 
 
-def _get_required(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+def _strip_json_comments(text: str) -> str:
+    lines = text.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            continue
+        line = re.sub(r"([,\]}]\s*)//.*$", r"\1", line)
+        result.append(line)
+    return "\n".join(result)
 
 
-def _get_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    normalized = value.strip().lower()
-    if normalized in ("true", "1", "yes", "on"):
-        return True
-    if normalized in ("false", "0", "no", "off"):
-        return False
-    raise RuntimeError(f"Invalid boolean value for {name}: {value!r}")
-
-
-def _get_int(name: str, default: int, min_value: int = 1) -> int:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    try:
-        result = int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"Environment variable {name} is not a valid integer") from exc
-    if result < min_value:
-        raise RuntimeError(f"Environment variable {name} must be at least {min_value}")
-    return result
+def _ensure_config_file() -> None:
+    if not CONFIG_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(TEMPLATE, encoding="utf-8")
+        raise SystemExit(
+            f"Config file created at {CONFIG_FILE}. "
+            "Please edit it with your credentials and restart the server."
+        )
 
 
 def load_config() -> AppConfig:
-    load_dotenv()
+    _ensure_config_file()
 
-    base_url = _get_required("OVERLEAF_BASE_URL").rstrip("/")
+    raw = CONFIG_FILE.read_text(encoding="utf-8")
+    clean = _strip_json_comments(raw)
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in {CONFIG_FILE}: {exc}") from exc
+
+    base_url = data.get("base_url", "").rstrip("/")
+    if not base_url:
+        raise RuntimeError(f"Missing required field 'base_url' in {CONFIG_FILE}")
     if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        raise RuntimeError("OVERLEAF_BASE_URL must start with http:// or https://")
+        raise RuntimeError("base_url must start with http:// or https://")
 
-    if base_url.startswith("http://") and not _get_bool("OVERLEAF_ALLOW_INSECURE_HTTP", False):
+    email = data.get("email", "")
+    if not email:
+        raise RuntimeError(f"Missing required field 'email' in {CONFIG_FILE}")
+
+    password = data.get("password", "")
+    if not password:
+        raise RuntimeError(f"Missing required field 'password' in {CONFIG_FILE}")
+
+    if base_url.startswith("http://") and not data.get("allow_insecure_http", False):
         raise RuntimeError(
-            "You are using an http:// URL. Set OVERLEAF_ALLOW_INSECURE_HTTP=true to proceed."
+            "You are using an http:// URL. Set 'allow_insecure_http' to true in "
+            f"{CONFIG_FILE} to proceed."
         )
 
-    timeout_raw = os.getenv("OVERLEAF_TIMEOUT_SECONDS")
-    if timeout_raw is not None:
-        timeout_seconds = _get_int("OVERLEAF_TIMEOUT_SECONDS", 15)
-    else:
-        legacy_ms = os.getenv("OVERLEAF_TIMEOUT_MS")
-        if legacy_ms is not None:
-            logger.warning(
-                "OVERLEAF_TIMEOUT_MS is deprecated; use OVERLEAF_TIMEOUT_SECONDS instead. "
-                "The old variable name was misleading — its value was already treated as seconds."
-            )
-            timeout_seconds = _get_int("OVERLEAF_TIMEOUT_MS", 15)
-        else:
-            timeout_seconds = 15
+    timeout_seconds = data.get("timeout_seconds", 15)
+    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
+        raise RuntimeError("timeout_seconds must be an integer >= 1")
 
-    raw_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = data.get("log_level", "INFO").upper()
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-    if raw_level not in valid_levels:
-        raise RuntimeError(f"Invalid LOG_LEVEL: {raw_level!r}. Must be one of {valid_levels}")
+    if log_level not in valid_levels:
+        raise RuntimeError(f"Invalid log_level: {log_level!r}. Must be one of {valid_levels}")
+
     return AppConfig(
         base_url=base_url,
-        email=_get_required("OVERLEAF_EMAIL"),
-        password=_get_required("OVERLEAF_PASSWORD"),
+        email=email,
+        password=password,
         timeout_seconds=timeout_seconds,
-        allow_insecure_http=_get_bool("OVERLEAF_ALLOW_INSECURE_HTTP", False),
-        log_level=raw_level,
+        allow_insecure_http=bool(data.get("allow_insecure_http", False)),
+        log_level=log_level,
     )

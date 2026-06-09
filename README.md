@@ -132,39 +132,57 @@ Examples:
 ### 1. Requirements
 
 - Python `3.10+`
+- `uv` (recommended) or `pip`
 - A self-hosted ShareLaTeX / Overleaf instance
 - An email/password account that can access at least one project
 
 ### 2. Install
 
 ```bash
-uv sync
-cp .env.example .env
+git clone https://github.com/your-org/sharelatex-mcp.git
+cd sharelatex-mcp
+uv tool install .
 ```
 
-### 3. Configure environment variables
+After installation, the `sharelatex-mcp` command is available globally.
 
-Edit `.env`:
+### 3. Configure
 
-```env
-OVERLEAF_BASE_URL=http://your-overleaf-host:2233
-OVERLEAF_EMAIL=your-email@example.com
-OVERLEAF_PASSWORD=your-password
-OVERLEAF_TIMEOUT_SECONDS=15
-OVERLEAF_ALLOW_INSECURE_HTTP=true
-LOG_LEVEL=INFO
+Run the server once to generate the default config file:
+
+```bash
+sharelatex-mcp
 ```
 
-Environment variables:
+This creates `~/.config/sharelatex-mcp/config.json` and exits. Edit it with your credentials:
 
-| Variable | Required | Description |
+```jsonc
+{
+  // Base URL of your self-hosted ShareLaTeX / Overleaf instance
+  "base_url": "http://your-overleaf-host:2233",
+  // Login email
+  "email": "your-email@example.com",
+  // Login password
+  "password": "your-password",
+  // HTTP request timeout in seconds (default: 15)
+  "timeout_seconds": 15,
+  // Set to true if you are using http:// instead of https://
+  "allow_insecure_http": false,
+  // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
+  "log_level": "INFO"
+}
+```
+
+Configuration fields:
+
+| Field | Required | Description |
 | --- | --- | --- |
-| `OVERLEAF_BASE_URL` | Yes | Base URL of your self-hosted ShareLaTeX / Overleaf instance |
-| `OVERLEAF_EMAIL` | Yes | Login email |
-| `OVERLEAF_PASSWORD` | Yes | Login password |
-| `OVERLEAF_TIMEOUT_SECONDS` | No | HTTP timeout in seconds. Default: `15` |
-| `OVERLEAF_ALLOW_INSECURE_HTTP` | No | Set `true` if you are using plain `http://` in a trusted local network |
-| `LOG_LEVEL` | No | MCP server log level. Default: `INFO` |
+| `base_url` | Yes | Base URL of your self-hosted ShareLaTeX / Overleaf instance |
+| `email` | Yes | Login email |
+| `password` | Yes | Login password |
+| `timeout_seconds` | No | HTTP timeout in seconds. Default: `15` |
+| `allow_insecure_http` | No | Set `true` if you are using plain `http://` in a trusted local network |
+| `log_level` | No | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. Default: `INFO` |
 
 ### 4. Smoke-test the connection
 
@@ -175,45 +193,37 @@ uv run python scripts/probe_projects.py
 
 If both commands succeed, the server can log in and discover projects correctly.
 
-### 5. Run the MCP server
+### 5. Connect from an MCP client
 
-```bash
-uv run sharelatex-mcp
-```
+#### OpenCode
 
-The server uses the MCP `stdio` transport, so it is intended to be launched by an MCP client rather than used as a standalone web service.
-
-### 6. Connect from an MCP client
-
-Use a generic `stdio` MCP configuration like this and adapt it to your client:
+Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "sharelatex": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/absolute/path/to/sharelatex-mcp",
-        "sharelatex-mcp"
-      ],
-      "env": {
-        "OVERLEAF_BASE_URL": "http://your-overleaf-host:2233",
-        "OVERLEAF_EMAIL": "your-email@example.com",
-        "OVERLEAF_PASSWORD": "your-password",
-        "OVERLEAF_TIMEOUT_SECONDS": "15",
-        "OVERLEAF_ALLOW_INSECURE_HTTP": "true",
-        "LOG_LEVEL": "INFO"
-      }
+      "type": "local",
+      "command": ["sharelatex-mcp"],
+      "enabled": true
     }
   }
 }
 ```
 
-If your client supports loading environment variables from a file, you can keep secrets in `.env` and only point the client to the repository directory.
+#### Other MCP clients (generic stdio)
 
-### 7. Typical first-run workflow
+```json
+{
+  "mcpServers": {
+    "sharelatex": {
+      "command": "sharelatex-mcp"
+    }
+  }
+}
+```
+
+### 6. Typical first-run workflow
 
 Once connected, a good first sequence is:
 
@@ -223,6 +233,14 @@ Once connected, a good first sequence is:
 4. Read a doc with `read_file`
 5. Trigger a compile with `compile_project`
 6. Inspect issues with `analyze_compile_errors`
+
+## 🔄 Upgrade
+
+```bash
+uv tool install --reinstall /path/to/sharelatex-mcp
+```
+
+Your config file at `~/.config/sharelatex-mcp/config.json` is preserved across upgrades.
 
 ## 🧪 Validation Commands
 
@@ -291,13 +309,13 @@ then this repository is built for that exact use case.
 
 ### Login loops back to `/login`
 
-- verify `OVERLEAF_BASE_URL`
+- verify `base_url` in `~/.config/sharelatex-mcp/config.json`
 - verify the email/password pair
 - confirm your instance still supports local password login
 
-### `OVERLEAF_ALLOW_INSECURE_HTTP` error
+### `allow_insecure_http` error
 
-- set `OVERLEAF_ALLOW_INSECURE_HTTP=true` only for trusted local-network `http://` deployments
+- set `allow_insecure_http` to `true` in `~/.config/sharelatex-mcp/config.json` only for trusted local-network `http://` deployments
 
 ### `too-recently-compiled`
 

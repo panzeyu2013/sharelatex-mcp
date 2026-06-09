@@ -119,39 +119,57 @@
 ### 1. 环境要求
 
 - Python `3.10+`
+- 推荐使用 `uv`（或 `pip`）
 - 一个自部署 ShareLaTeX / Overleaf 实例
 - 一个能访问至少一个项目的邮箱密码账号
 
 ### 2. 安装
 
 ```bash
-uv sync
-cp .env.example .env
+git clone https://github.com/your-org/sharelatex-mcp.git
+cd sharelatex-mcp
+uv tool install .
 ```
 
-### 3. 配置环境变量
+安装后 `sharelatex-mcp` 命令即可全局使用。
 
-编辑 `.env`：
+### 3. 配置
 
-```env
-OVERLEAF_BASE_URL=http://your-overleaf-host:2233
-OVERLEAF_EMAIL=your-email@example.com
-OVERLEAF_PASSWORD=your-password
-OVERLEAF_TIMEOUT_SECONDS=15
-OVERLEAF_ALLOW_INSECURE_HTTP=true
-LOG_LEVEL=INFO
+首次启动会自动生成默认配置文件：
+
+```bash
+sharelatex-mcp
 ```
 
-变量说明：
+这会在 `~/.config/sharelatex-mcp/config.json` 生成模板并退出。编辑该文件填入你的凭证：
 
-| 变量名 | 必填 | 说明 |
+```jsonc
+{
+  // 自部署 ShareLaTeX / Overleaf 实例地址
+  "base_url": "http://your-overleaf-host:2233",
+  // 登录邮箱
+  "email": "your-email@example.com",
+  // 登录密码
+  "password": "your-password",
+  // HTTP 请求超时秒数（默认 15）
+  "timeout_seconds": 15,
+  // 若使用 http:// 而非 https://，设为 true
+  "allow_insecure_http": false,
+  // 日志级别：DEBUG / INFO / WARNING / ERROR / CRITICAL
+  "log_level": "INFO"
+}
+```
+
+配置项说明：
+
+| 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `OVERLEAF_BASE_URL` | 是 | 你的自部署 ShareLaTeX / Overleaf 基础地址 |
-| `OVERLEAF_EMAIL` | 是 | 登录邮箱 |
-| `OVERLEAF_PASSWORD` | 是 | 登录密码 |
-| `OVERLEAF_TIMEOUT_SECONDS` | 否 | HTTP 超时秒数，默认 `15` |
-| `OVERLEAF_ALLOW_INSECURE_HTTP` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
-| `LOG_LEVEL` | 否 | MCP 服务日志级别，默认 `INFO` |
+| `base_url` | 是 | 你的自部署 ShareLaTeX / Overleaf 基础地址 |
+| `email` | 是 | 登录邮箱 |
+| `password` | 是 | 登录密码 |
+| `timeout_seconds` | 否 | HTTP 超时秒数，默认 `15` |
+| `allow_insecure_http` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
+| `log_level` | 否 | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO` |
 
 ### 4. 先做连通性验证
 
@@ -162,45 +180,37 @@ uv run python scripts/probe_projects.py
 
 如果这两条命令都成功，说明登录和项目发现链路是通的。
 
-### 5. 启动 MCP 服务
+### 5. 接入 MCP 客户端
 
-```bash
-uv run sharelatex-mcp
-```
+#### OpenCode
 
-这个服务使用 MCP 的 `stdio` 传输方式，因此更适合作为 MCP 客户端的后端进程来启动，而不是单独作为 Web 服务运行。
-
-### 6. 接入 MCP 客户端
-
-可以先用下面这个通用 `stdio` MCP 配置示例，再按你的客户端格式做适配：
+在 `~/.config/opencode/opencode.json` 中添加：
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "sharelatex": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/absolute/path/to/sharelatex-mcp",
-        "sharelatex-mcp"
-      ],
-      "env": {
-        "OVERLEAF_BASE_URL": "http://your-overleaf-host:2233",
-        "OVERLEAF_EMAIL": "your-email@example.com",
-        "OVERLEAF_PASSWORD": "your-password",
-        "OVERLEAF_TIMEOUT_SECONDS": "15",
-        "OVERLEAF_ALLOW_INSECURE_HTTP": "true",
-        "LOG_LEVEL": "INFO"
-      }
+      "type": "local",
+      "command": ["sharelatex-mcp"],
+      "enabled": true
     }
   }
 }
 ```
 
-如果你的 MCP 客户端支持从 `.env` 加载环境变量，也可以把密码继续保留在 `.env` 中，只在客户端里指向仓库目录即可。
+#### 其他 MCP 客户端（通用 stdio 格式）
 
-### 7. 首次使用推荐顺序
+```json
+{
+  "mcpServers": {
+    "sharelatex": {
+      "command": "sharelatex-mcp"
+    }
+  }
+}
+```
+
+### 6. 首次使用推荐顺序
 
 接入成功后，推荐先按这个顺序试：
 
@@ -210,6 +220,14 @@ uv run sharelatex-mcp
 4. 用 `read_file` 读取一个文档
 5. 用 `compile_project` 触发编译
 6. 用 `analyze_compile_errors` 查看结构化问题
+
+## 🔄 升级
+
+```bash
+uv tool install --reinstall /path/to/sharelatex-mcp
+```
+
+配置文件 `~/.config/sharelatex-mcp/config.json` 在升级时不会被覆盖。
 
 ## 🧪 验证命令
 
@@ -302,13 +320,13 @@ uv run python scripts/test_compile_diagnostics.py
 
 ### 登录后还是跳回 `/login`
 
-- 检查 `OVERLEAF_BASE_URL` 是否正确
+- 检查 `~/.config/sharelatex-mcp/config.json` 中的 `base_url` 是否正确
 - 检查邮箱和密码是否正确
 - 确认你的实例仍然支持本地邮箱密码登录
 
-### 报 `OVERLEAF_ALLOW_INSECURE_HTTP` 错误
+### 报 `allow_insecure_http` 错误
 
-- 如果你在可信局域网里用的是 `http://`，请显式设置 `OVERLEAF_ALLOW_INSECURE_HTTP=true`
+- 如果你在可信局域网里用的是 `http://`，请在 `~/.config/sharelatex-mcp/config.json` 中将 `allow_insecure_http` 设为 `true`
 
 ### 遇到 `too-recently-compiled`
 
