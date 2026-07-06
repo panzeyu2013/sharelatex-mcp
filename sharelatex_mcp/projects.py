@@ -14,6 +14,7 @@ from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
+from diff_match_patch import diff_match_patch  # package: diff-match-patch (PyPI)
 from websocket import WebSocketConnectionClosedException
 
 from sharelatex_mcp.http import HttpResult
@@ -27,6 +28,38 @@ from sharelatex_mcp.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_diff_operations(old: str, new: str) -> list[dict[str, Any]]:
+    """Compute minimal sharejs-text-ot operations from old to new content.
+
+    Uses Myers diff algorithm (via diff-match-patch) for guaranteed minimal
+    edit distance.  Returns a list of operations that can be sent as a batch
+    to ``applyOtUpdate``.  Each operation's position is correct for sequential
+    application by the ShareJS OT engine.
+    """
+    if old == new:
+        return []
+
+    dmp = diff_match_patch()
+    diffs = dmp.diff_main(old, new)
+    dmp.diff_cleanupMerge(diffs)
+
+    ops: list[dict[str, Any]] = []
+    position = 0
+
+    for op, text in diffs:
+        if not text:
+            continue
+        if op == 0:  # EQUAL
+            position += len(text)
+        elif op == -1:  # DELETE
+            ops.append({"p": position, "d": text})
+        elif op == 1:  # INSERT
+            ops.append({"p": position, "i": text})
+            position += len(text)
+
+    return ops
 
 
 @dataclass
@@ -1433,19 +1466,33 @@ class ProjectClient:
                 "message": "File content unchanged, skipped write",
             }
 
-        logger.info("Writing to %s in project %s (%d chars)", path, project_id, len(content))
+        try:
+            operations = _compute_diff_operations(current, content)
+        except Exception:
+            logger.exception("Diff computation failed, falling back to full replacement")
+            operations = [{"p": 0, "d": current}, {"p": 0, "i": content}]
 
-        operations = [
-            {"p": 0, "d": current},
-            {"p": 0, "i": content},
-        ]
+        logger.info(
+            "Writing to %s in project %s (diff: %d ops, was %d chars, now %d chars)",
+            path, project_id, len(operations), len(current), len(content),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            op_count = len(operations)
+            if op_count <= 50:
+                logger.debug("Diff operations for %s: %s", path, operations)
+            else:
+                logger.debug(
+                    "Diff operations for %s: %d ops (first 10: %s)",
+                    path, op_count, operations[:10],
+                )
+
         self.realtime_client.join_doc_and_apply_ot(
             project_id=project_id,
             doc_id=validate_path_segment(target.entity_id, "doc_id"),
             operations=operations,
         )
         self._invalidate_caches(project_id)
-        logger.debug("Write operation sent for %s in project %s", path, project_id)
+        logger.debug("Write operation sent for %s in project %s (diff: %d ops)", path, project_id, len(operations))
         return {
             "project_id": project_id,
             "path": path,

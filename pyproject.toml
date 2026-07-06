@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
   "beautifulsoup4>=4.12.3",
+  "diff-match-patch>=20241021,<20260000",
   "mcp>=1.9.4",
   "requests>=2.32.3",
   "websocket-client>=1.9.0"
@@ -35,6 +36,7 @@ dev = [
   "mypy>=1.15",
   "pytest>=8",
   "pytest-asyncio>=0.25",
+  "pytest-timeout>=2.3",
   "ruff>=0.11",
 ]
 

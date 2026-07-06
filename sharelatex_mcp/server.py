@@ -147,8 +147,9 @@ def create_server() -> FastMCP:
     @mcp.tool(
         name="write_file",
         description=(
-            "Write content to a doc-type text file. Uses legacy socket.io + "
-            "sharejs-text-ot full-document replacement. Skips if content is unchanged."
+            "Write content to a doc-type text file. Uses socket.io + "
+            "sharejs-text-ot to apply minimal character-level diffs. "
+            "Skips if content is unchanged."
         ),
     )
     def write_file(project_id: str, path: str, content: str) -> dict:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from requests.structures import CaseInsensitiveDict
 
 import sharelatex_mcp.realtime as realtime_module
 from sharelatex_mcp.http import HttpResult
-from sharelatex_mcp.projects import ProjectClient
+from sharelatex_mcp.projects import ProjectClient, ProjectEntity
 from sharelatex_mcp.validation import validate_http_path, validate_project_id
 
 
@@ -113,3 +114,92 @@ def test_realtime_apply_ot_success_ack_is_success(monkeypatch: pytest.MonkeyPatc
     )
 
     assert result.version == 7
+
+
+def test_write_file_uses_diff_operations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """write_file must send diff-based OT ops, not full-replacement ops."""
+    client = _make_project_client()
+
+    captured_ops: list[list[dict[str, Any]]] = []
+
+    def fake_join_doc_and_apply_ot(
+        self: Any, project_id: str, doc_id: str, operations: list[dict[str, Any]]
+    ) -> Any:
+        captured_ops.append(operations)
+        return SimpleNamespace(version=1)
+
+    monkeypatch.setattr(
+        "sharelatex_mcp.realtime.RealtimeProjectClient.join_doc_and_apply_ot",
+        fake_join_doc_and_apply_ot,
+    )
+
+    def fake_resolve_entity_by_path(
+        project_id: str, path: str
+    ) -> ProjectEntity:
+        return ProjectEntity(path=path, type="doc", entity_id="doc123")
+
+    monkeypatch.setattr(client, "_resolve_entity_by_path", fake_resolve_entity_by_path)
+
+    def fake_read_file(
+        project_id: str, path: str
+    ) -> dict[str, str]:
+        return {"content": "hello world"}
+
+    monkeypatch.setattr(client, "read_file", fake_read_file)
+
+    result = client.write_file("0123456789abcdef01234567", "main.tex", "hello there world")
+
+    assert result["changed"] is True
+    assert captured_ops
+    # Verify diff-based ops are used (not full replacement)
+    assert captured_ops[0] == [{"p": 6, "i": "there "}]
+
+
+def test_write_file_falls_back_on_diff_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """write_file must fall back to full replacement when diff computation fails."""
+    client = _make_project_client()
+
+    captured_ops: list[list[dict[str, Any]]] = []
+
+    def fake_join_doc_and_apply_ot(
+        self: Any, project_id: str, doc_id: str, operations: list[dict[str, Any]]
+    ) -> Any:
+        captured_ops.append(operations)
+        return SimpleNamespace(version=1)
+
+    monkeypatch.setattr(
+        "sharelatex_mcp.realtime.RealtimeProjectClient.join_doc_and_apply_ot",
+        fake_join_doc_and_apply_ot,
+    )
+
+    def fake_resolve_entity_by_path(
+        project_id: str, path: str
+    ) -> ProjectEntity:
+        return ProjectEntity(path=path, type="doc", entity_id="doc123")
+
+    monkeypatch.setattr(client, "_resolve_entity_by_path", fake_resolve_entity_by_path)
+
+    def fake_read_file(
+        project_id: str, path: str
+    ) -> dict[str, str]:
+        return {"content": "hello world"}
+
+    monkeypatch.setattr(client, "read_file", fake_read_file)
+
+    # Simulate diff computation failure
+    def fake_diff_failure(old: str, new: str) -> list[dict[str, Any]]:
+        raise MemoryError("simulated diff failure")
+
+    monkeypatch.setattr(
+        "sharelatex_mcp.projects._compute_diff_operations",
+        fake_diff_failure,
+    )
+
+    result = client.write_file("0123456789abcdef01234567", "main.tex", "hello there world")
+
+    assert result["changed"] is True
+    assert captured_ops
+    assert captured_ops[0] == [
+        {"p": 0, "d": "hello world"},
+        {"p": 0, "i": "hello there world"},
+    ]
