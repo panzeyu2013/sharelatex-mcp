@@ -10,10 +10,7 @@ from sharelatex_mcp.session import OverleafSessionManager
 
 
 def _normalize_tool_result(result):
-    if isinstance(result, tuple):
-        blocks = result[0]
-    else:
-        blocks = result
+    blocks = result[0] if isinstance(result, tuple) else result
 
     normalized = []
     for block in blocks:
@@ -23,23 +20,23 @@ def _normalize_tool_result(result):
     return normalized
 
 
-def _choose_project(projects: list[dict]) -> dict:
-    preferred_id = os.getenv("OVERLEAF_PROJECT_ID", "").strip()
-    if preferred_id:
-        matched = next((project for project in projects if project.get("project_id") == preferred_id), None)
-        if matched is None:
-            raise RuntimeError(f"未找到环境变量 OVERLEAF_PROJECT_ID 指定的项目: {preferred_id}")
-        return matched
+def _configured_project_id(config) -> str:
+    project_id = os.getenv("OVERLEAF_PROJECT_ID", "").strip() or config.project_id
+    if not project_id:
+        raise RuntimeError(
+            "此脚本会创建、写入并删除真实项目文档。请先设置 OVERLEAF_PROJECT_ID，"
+            "或在 ~/.config/sharelatex-mcp/config.json 中设置 project_id。"
+        )
+    return project_id
 
-    for project in projects:
-        if not project.get("trashed") and not project.get("archived"):
-            return project
-    for project in projects:
-        if not project.get("trashed"):
-            return project
-    if not projects:
-        raise RuntimeError("没有可用于写入测试的项目")
-    return projects[0]
+
+def _choose_project(projects: list[dict], project_id: str) -> dict:
+    matched = next((project for project in projects if project.get("project_id") == project_id), None)
+    if matched is None:
+        raise RuntimeError(f"未找到指定写入测试项目: {project_id}")
+    if matched.get("trashed") or matched.get("archived"):
+        raise RuntimeError(f"指定写入测试项目已归档或在回收站中: {project_id}")
+    return matched
 
 
 async def main() -> None:
@@ -48,11 +45,12 @@ async def main() -> None:
 
     server = create_server()
     config = load_config()
+    preferred_project_id = _configured_project_id(config)
     session_manager = OverleafSessionManager(config)
     project_client = ProjectClient(session_manager)
     projects_result = await server.call_tool("list_projects", {})
     projects = _normalize_tool_result(projects_result)
-    project = _choose_project(projects)
+    project = _choose_project(projects, preferred_project_id)
     project_id = project["project_id"]
     print("selected_project:")
     print(json.dumps(project, ensure_ascii=False, indent=2))

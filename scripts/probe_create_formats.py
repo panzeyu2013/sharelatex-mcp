@@ -11,17 +11,19 @@ def main() -> None:
     session.ensure_logged_in()
     project_client = ProjectClient(session)
 
-    preferred_id = os.getenv("OVERLEAF_PROJECT_ID", "").strip()
+    preferred_id = os.getenv("OVERLEAF_PROJECT_ID", "").strip() or config.project_id
+    if not preferred_id:
+        raise RuntimeError(
+            "此探针会在真实项目中创建文档。请先设置 OVERLEAF_PROJECT_ID，"
+            "或在 ~/.config/sharelatex-mcp/config.json 中设置 project_id。"
+        )
     projects = project_client.list_projects()
     project = None
-    if preferred_id:
-        project = next((item for item in projects if item.project_id == preferred_id), None)
-        if project is None:
-            raise RuntimeError(f"未找到环境变量 OVERLEAF_PROJECT_ID 指定的项目: {preferred_id}")
-    else:
-        project = next((item for item in projects if not item.trashed and not item.archived), None)
-        project = project or next((item for item in projects if not item.trashed), None)
-        project = project or (projects[0] if projects else None)
+    project = next((item for item in projects if item.project_id == preferred_id), None)
+    if project is None:
+        raise RuntimeError(f"未找到指定探针项目: {preferred_id}")
+    if project.trashed or project.archived:
+        raise RuntimeError(f"指定探针项目已归档或在回收站中: {preferred_id}")
     if project is None:
         raise RuntimeError("没有可用于探测 create 接口的项目")
 

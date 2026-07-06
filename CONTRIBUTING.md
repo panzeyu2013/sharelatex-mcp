@@ -13,16 +13,16 @@ Run the server once to generate the default config at `~/.config/sharelatex-mcp/
 Run the checks in this order:
 
 ```bash
+uv run pytest
 uv run python scripts/probe_login.py
 uv run python scripts/probe_projects.py
-uv run python scripts/test_write_roundtrip.py
-uv run python scripts/test_compile_roundtrip.py
-uv run python scripts/test_compile_diagnostics.py
-uv run python scripts/test_mcp_tools.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_mcp_tools.py
 ```
 
 ## Notes
 
-- `scripts/test_mcp_tools.py` performs create, move, rename, upload, replace, compile, and cleanup operations against a real project.
-- If you want to pin a specific project for local testing, set `project_id` in `~/.config/sharelatex-mcp/config.json` (add the field manually).
+- `scripts/test_mcp_tools.py` performs create, move, rename, upload, replace, and cleanup operations against a real project. Set `TEST_COMPILE=true` when you also want it to run compile checks.
+- Scripts that write, compile, or delete remote project content require `OVERLEAF_PROJECT_ID` or `project_id` in `~/.config/sharelatex-mcp/config.json`.
 - Please avoid committing local environment files, generated artifacts, or private instance details.

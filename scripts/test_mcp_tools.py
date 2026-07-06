@@ -5,14 +5,12 @@ import os
 import tempfile
 import time
 
+from sharelatex_mcp.config import load_config
 from sharelatex_mcp.server import create_server
 
 
 def _normalize_tool_result(result) -> list[dict]:
-    if isinstance(result, tuple):
-        blocks = result[0]
-    else:
-        blocks = result
+    blocks = result[0] if isinstance(result, tuple) else result
 
     normalized = []
     for block in blocks:
@@ -23,12 +21,27 @@ def _normalize_tool_result(result) -> list[dict]:
     return normalized
 
 
-def _pick_test_project(projects: list[dict]) -> dict:
-    active = next(
-        (project for project in projects if not project.get("trashed") and not project.get("archived")),
+def _configured_project_id() -> str:
+    config = load_config()
+    project_id = os.getenv("OVERLEAF_PROJECT_ID", "").strip() or config.project_id
+    if not project_id:
+        raise RuntimeError(
+            "此脚本会修改真实项目。请先设置 OVERLEAF_PROJECT_ID，"
+            "或在 ~/.config/sharelatex-mcp/config.json 中设置 project_id。"
+        )
+    return project_id
+
+
+def _pick_test_project(projects: list[dict], project_id: str) -> dict:
+    matched = next(
+        (project for project in projects if project.get("project_id") == project_id),
         None,
     )
-    return active or projects[0]
+    if matched is None:
+        raise RuntimeError(f"未找到指定测试项目: {project_id}")
+    if matched.get("trashed") or matched.get("archived"):
+        raise RuntimeError(f"指定测试项目已归档或在回收站中: {project_id}")
+    return matched
 
 
 async def _find_entity_by_path(server, project_id: str, path: str) -> dict | None:
@@ -38,6 +51,7 @@ async def _find_entity_by_path(server, project_id: str, path: str) -> dict | Non
 
 
 async def main() -> None:
+    preferred_project_id = _configured_project_id()
     server = create_server()
     run_compile_checks = os.getenv("TEST_COMPILE", "").strip().lower() == "true"
 
@@ -54,7 +68,7 @@ async def main() -> None:
         print("\n没有可用于测试的项目，跳过 open_project 验证。")
         return
 
-    test_project = _pick_test_project(projects)
+    test_project = _pick_test_project(projects, preferred_project_id)
     project_id = test_project["project_id"]
     print("\n选中的测试项目：")
     print(json.dumps(test_project, ensure_ascii=False, indent=2))
@@ -164,7 +178,10 @@ async def main() -> None:
                 os.remove(temp_doc_download_path)
 
     if binary_file:
-        fd, temp_download_path = tempfile.mkstemp(prefix="codex-sharelatex-file-", suffix=os.path.splitext(binary_file["path"])[1])
+        fd, temp_download_path = tempfile.mkstemp(
+            prefix="codex-sharelatex-file-",
+            suffix=os.path.splitext(binary_file["path"])[1],
+        )
         os.close(fd)
         try:
             download_result = await server.call_tool(
@@ -203,6 +220,7 @@ async def main() -> None:
     doc_payload = None
     uploaded_file_payload = None
     root_doc_temp_payload = None
+    temp_root_path = None
 
     folder_a_result = await server.call_tool(
         "create_folder",
@@ -242,11 +260,16 @@ async def main() -> None:
         print("\ncreate_folder（folder_b）结果：")
         print(json.dumps(folder_b_payload, ensure_ascii=False, indent=2))
 
-        temp_upload_input = tempfile.NamedTemporaryFile(prefix="codex-sharelatex-upload-", suffix=".png", delete=False)
-        temp_upload_input.write(
-            base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+iY8cAAAAASUVORK5CYII=")
+        upload_image = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQ"
+            "VR42mP8/x8AAwMCAO+iY8cAAAAASUVORK5CYII="
         )
-        temp_upload_input.close()
+        with tempfile.NamedTemporaryFile(
+            prefix="codex-sharelatex-upload-",
+            suffix=".png",
+            delete=False,
+        ) as temp_upload_input:
+            temp_upload_input.write(base64.b64decode(upload_image))
         try:
             upload_result = await server.call_tool(
                 "upload_file",
@@ -263,7 +286,11 @@ async def main() -> None:
             if not upload_payload.get("ok"):
                 raise RuntimeError("upload_file 返回失败")
 
-            uploaded_file_payload = await _find_entity_by_path(server, project_id, f"{folder_a_renamed_path}/{upload_name}")
+            uploaded_file_payload = await _find_entity_by_path(
+                server,
+                project_id,
+                f"{folder_a_renamed_path}/{upload_name}",
+            )
             if uploaded_file_payload is None:
                 raise RuntimeError(f"上传后的文件不存在: {folder_a_renamed_path}/{upload_name}")
 
@@ -279,7 +306,11 @@ async def main() -> None:
             print("\nrename_entity（fileRef）结果：")
             print(json.dumps(rename_upload_payload, ensure_ascii=False, indent=2))
 
-            renamed_upload = await _find_entity_by_path(server, project_id, f"{folder_a_renamed_path}/{upload_renamed_name}")
+            renamed_upload = await _find_entity_by_path(
+                server,
+                project_id,
+                f"{folder_a_renamed_path}/{upload_renamed_name}",
+            )
             if renamed_upload is None:
                 raise RuntimeError(f"重命名后的上传文件不存在: {folder_a_renamed_path}/{upload_renamed_name}")
             uploaded_file_payload = renamed_upload
@@ -301,11 +332,16 @@ async def main() -> None:
                 raise RuntimeError(f"移动后的上传文件不存在: {moved_upload_path}")
             uploaded_file_payload = moved_upload
 
-            temp_replace_input = tempfile.NamedTemporaryFile(prefix="codex-sharelatex-replace-", suffix=".png", delete=False)
-            temp_replace_input.write(
-                base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR42mNk+M/wHwAEAQH/cetH5QAAAABJRU5ErkJggg==")
+            replace_image = (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlE"
+                "QVR42mNk+M/wHwAEAQH/cetH5QAAAABJRU5ErkJggg=="
             )
-            temp_replace_input.close()
+            with tempfile.NamedTemporaryFile(
+                prefix="codex-sharelatex-replace-",
+                suffix=".png",
+                delete=False,
+            ) as temp_replace_input:
+                temp_replace_input.write(base64.b64decode(replace_image))
             try:
                 replace_result = await server.call_tool(
                     "replace_file",
@@ -353,7 +389,12 @@ async def main() -> None:
                 if os.path.exists(temp_uploaded_download_path):
                     os.remove(temp_uploaded_download_path)
 
-            write_probe_content = "\\documentclass{article}\n\\begin{document}\nCodex write roundtrip check.\n\\end{document}\n"
+            write_probe_content = (
+                "\\documentclass{article}\n"
+                "\\begin{document}\n"
+                "Codex write roundtrip check.\n"
+                "\\end{document}\n"
+            )
             write_probe_name = f".codex-mcp-write-{temp_suffix}.tex"
             write_probe_result = await server.call_tool(
                 "create_doc",
@@ -410,44 +451,48 @@ async def main() -> None:
         print("\ncreate_doc（folder_a 内）结果：")
         print(json.dumps(doc_payload, ensure_ascii=False, indent=2))
 
-        root_doc_temp_result = await server.call_tool(
-            "create_doc",
-            {
-                "project_id": project_id,
-                "name": root_doc_name,
-                "parent_folder_id": folder_a_payload["entity_id"],
-            },
-        )
-        root_doc_temp_payload = _normalize_tool_result(root_doc_temp_result)[0]
-        print("\ncreate_doc（root doc temp）结果：")
-        print(json.dumps(root_doc_temp_payload, ensure_ascii=False, indent=2))
+        original_root_path = root_doc_payload.get("root_doc_path")
+        if original_root_path:
+            root_doc_temp_result = await server.call_tool(
+                "create_doc",
+                {
+                    "project_id": project_id,
+                    "name": root_doc_name,
+                    "parent_folder_id": folder_a_payload["entity_id"],
+                },
+            )
+            root_doc_temp_payload = _normalize_tool_result(root_doc_temp_result)[0]
+            print("\ncreate_doc（root doc temp）结果：")
+            print(json.dumps(root_doc_temp_payload, ensure_ascii=False, indent=2))
 
-        temp_root_path = f"{folder_a_renamed_path}/{root_doc_name}"
-        set_root_doc_result = await server.call_tool(
-            "set_root_doc",
-            {
-                "project_id": project_id,
-                "path": temp_root_path,
-            },
-        )
-        set_root_doc_payload = _normalize_tool_result(set_root_doc_result)[0]
-        print("\nset_root_doc（临时文档）结果：")
-        print(json.dumps(set_root_doc_payload, ensure_ascii=False, indent=2))
-        if set_root_doc_payload.get("root_doc_path") != temp_root_path:
-            raise RuntimeError("set_root_doc 未成功切换到临时文档")
+            temp_root_path = f"{folder_a_renamed_path}/{root_doc_name}"
+            set_root_doc_result = await server.call_tool(
+                "set_root_doc",
+                {
+                    "project_id": project_id,
+                    "path": temp_root_path,
+                },
+            )
+            set_root_doc_payload = _normalize_tool_result(set_root_doc_result)[0]
+            print("\nset_root_doc（临时文档）结果：")
+            print(json.dumps(set_root_doc_payload, ensure_ascii=False, indent=2))
+            if set_root_doc_payload.get("root_doc_path") != temp_root_path:
+                raise RuntimeError("set_root_doc 未成功切换到临时文档")
 
-        restore_root_doc_result = await server.call_tool(
-            "set_root_doc",
-            {
-                "project_id": project_id,
-                "path": root_doc_payload["root_doc_path"],
-            },
-        )
-        restore_root_doc_payload = _normalize_tool_result(restore_root_doc_result)[0]
-        print("\nset_root_doc（恢复原 root doc）结果：")
-        print(json.dumps(restore_root_doc_payload, ensure_ascii=False, indent=2))
-        if restore_root_doc_payload.get("root_doc_path") != root_doc_payload["root_doc_path"]:
-            raise RuntimeError("未能恢复原始 root doc")
+            restore_root_doc_result = await server.call_tool(
+                "set_root_doc",
+                {
+                    "project_id": project_id,
+                    "path": original_root_path,
+                },
+            )
+            restore_root_doc_payload = _normalize_tool_result(restore_root_doc_result)[0]
+            print("\nset_root_doc（恢复原 root doc）结果：")
+            print(json.dumps(restore_root_doc_payload, ensure_ascii=False, indent=2))
+            if restore_root_doc_payload.get("root_doc_path") != original_root_path:
+                raise RuntimeError("未能恢复原始 root doc")
+        else:
+            print("\n原项目没有 root doc，跳过 set_root_doc 切换测试。")
 
         rename_doc_result = await server.call_tool(
             "rename_entity",
@@ -477,6 +522,21 @@ async def main() -> None:
         if move_doc_payload.get("new_path") != moved_doc_path:
             raise RuntimeError("move_entity(doc) 返回的新路径与预期不一致")
     finally:
+        root_doc_temp_is_current = False
+        cleanup_error = None
+        if root_doc_temp_payload is not None:
+            current_root_result = await server.call_tool("get_root_doc", {"project_id": project_id})
+            current_root_payload = _normalize_tool_result(current_root_result)[0]
+            root_doc_temp_is_current = (
+                current_root_payload.get("root_doc_id") == root_doc_temp_payload["entity_id"]
+                or current_root_payload.get("root_doc_path") == temp_root_path
+            )
+            if root_doc_temp_is_current:
+                cleanup_error = (
+                    "临时 root doc 仍是当前 root doc，已跳过删除临时 root doc 和其父文件夹，"
+                    "请先恢复项目 root doc 后再清理。"
+                )
+
         if doc_payload is not None:
             delete_doc_result = await server.call_tool(
                 "delete_entity",
@@ -490,7 +550,7 @@ async def main() -> None:
             print("\ndelete_entity（doc）结果：")
             print(json.dumps(delete_doc_payload, ensure_ascii=False, indent=2))
 
-        if root_doc_temp_payload is not None:
+        if root_doc_temp_payload is not None and not root_doc_temp_is_current:
             delete_root_doc_result = await server.call_tool(
                 "delete_entity",
                 {
@@ -502,6 +562,8 @@ async def main() -> None:
             delete_root_doc_payload = _normalize_tool_result(delete_root_doc_result)[0]
             print("\ndelete_entity（root doc temp）结果：")
             print(json.dumps(delete_root_doc_payload, ensure_ascii=False, indent=2))
+        elif root_doc_temp_payload is not None:
+            print(f"\n跳过删除当前 root doc 临时文档: {temp_root_path}")
 
         if uploaded_file_payload is not None:
             delete_upload_result = await server.call_tool(
@@ -529,7 +591,7 @@ async def main() -> None:
             print("\ndelete_entity（folder_b）结果：")
             print(json.dumps(delete_folder_b_payload, ensure_ascii=False, indent=2))
 
-        if folder_a_payload is not None:
+        if folder_a_payload is not None and not root_doc_temp_is_current:
             delete_folder_a_result = await server.call_tool(
                 "delete_entity",
                 {
@@ -541,6 +603,11 @@ async def main() -> None:
             delete_folder_a_payload = _normalize_tool_result(delete_folder_a_result)[0]
             print("\ndelete_entity（folder_a）结果：")
             print(json.dumps(delete_folder_a_payload, ensure_ascii=False, indent=2))
+        elif folder_a_payload is not None:
+            print(f"\n跳过删除包含当前 root doc 的临时文件夹: {folder_a_renamed_path}")
+
+        if cleanup_error:
+            raise RuntimeError(cleanup_error)
 
 
 if __name__ == "__main__":

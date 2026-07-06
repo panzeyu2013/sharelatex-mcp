@@ -10,8 +10,8 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
-from urllib.parse import urljoin, urlparse
+from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from websocket import WebSocketConnectionClosedException
@@ -19,6 +19,12 @@ from websocket import WebSocketConnectionClosedException
 from sharelatex_mcp.http import HttpResult
 from sharelatex_mcp.realtime import RealtimeProjectClient
 from sharelatex_mcp.session import OverleafSessionManager
+from sharelatex_mcp.validation import (
+    normalize_entity_type,
+    validate_entity_id,
+    validate_path_segment,
+    validate_project_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +146,11 @@ class ProjectClient:
     def _request_with_csrf_retry(
         self,
         project_id: str,
-        request_fn: Callable[[dict[str, str]], Any],
+        request_fn: Callable[[dict[str, str]], HttpResult],
         extra_headers: dict[str, str] | None = None,
-    ) -> Any:
-        result = None
+    ) -> HttpResult:
+        project_id = validate_project_id(project_id)
+        result: HttpResult | None = None
         for force_refresh in (False, True):
             csrf_token = self.session_manager.get_csrf_token(
                 project_id=project_id, force_refresh=force_refresh,
@@ -154,6 +161,7 @@ class ProjectClient:
             result = request_fn(headers)
             if result.status_code != 403:
                 return result
+        assert result is not None
         return result
 
     def _post_json_with_csrf(
@@ -163,6 +171,7 @@ class ProjectClient:
         payload: dict[str, object],
         extra_headers: dict[str, str] | None = None,
     ) -> HttpResult:
+        project_id = validate_project_id(project_id)
         return self._request_with_csrf_retry(
             project_id=project_id,
             request_fn=lambda headers: self.session_manager.http.post_json(
@@ -180,6 +189,7 @@ class ProjectClient:
         params: dict[str, str] | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> HttpResult:
+        project_id = validate_project_id(project_id)
         result: HttpResult | None = None
         for force_refresh in (False, True):
             csrf_token = self.session_manager.get_csrf_token(
@@ -208,6 +218,7 @@ class ProjectClient:
         path: str,
         extra_headers: dict[str, str] | None = None,
     ) -> HttpResult:
+        project_id = validate_project_id(project_id)
         return self._request_with_csrf_retry(
             project_id=project_id,
             request_fn=lambda headers: self.session_manager.http.delete(
@@ -271,7 +282,7 @@ class ProjectClient:
         }
 
     def _map_entity_type(self, entity_type: str) -> str:
-        return "file" if entity_type == "fileRef" else entity_type
+        return normalize_entity_type(entity_type)
 
     def _get_cached_entity(self, project_id: str, path: str) -> ProjectEntity | None:
         return self._entity_cache.get(project_id, {}).get(path)
@@ -353,6 +364,7 @@ class ProjectClient:
         return []
 
     def open_project(self, project_id: str) -> dict[str, str | int | None]:
+        project_id = validate_project_id(project_id)
         self.session_manager.ensure_logged_in()
         logger.info("Opening project %s", project_id)
         result = self.session_manager.http.get(f"/project/{project_id}")
@@ -365,6 +377,7 @@ class ProjectClient:
         }
 
     def get_project_diagnostics(self, project_id: str) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         self.session_manager.ensure_logged_in()
         logger.info("Reading diagnostics for project %s", project_id)
         result = self.session_manager.http.get(f"/project/{project_id}")
@@ -372,12 +385,14 @@ class ProjectClient:
             raise RuntimeError(f"Failed to read project page, status code: {result.status_code}")
 
         soup = BeautifulSoup(result.text, "html.parser")
-        exposed_settings = self._read_meta_json(soup, "ol-ExposedSettings") or {}
-        user_features = (self._read_meta_json(soup, "ol-user") or {}).get("features", {})
-        compile_settings = self._read_meta_json(soup, "ol-compileSettings") or {}
-        user_settings = self._read_meta_json(soup, "ol-userSettings") or {}
-        capabilities = self._read_meta_json(soup, "ol-capabilities") or []
-        project_tags = self._read_meta_json(soup, "ol-projectTags") or []
+        exposed_settings = self._read_meta_dict(soup, "ol-ExposedSettings")
+        user = self._read_meta_dict(soup, "ol-user")
+        raw_user_features = user.get("features", {})
+        user_features = raw_user_features if isinstance(raw_user_features, dict) else {}
+        compile_settings = self._read_meta_dict(soup, "ol-compileSettings")
+        user_settings = self._read_meta_dict(soup, "ol-userSettings")
+        capabilities = self._read_meta_list(soup, "ol-capabilities")
+        project_tags = self._read_meta_list(soup, "ol-projectTags")
 
         return {
             "project_id": project_id,
@@ -413,6 +428,7 @@ class ProjectClient:
         }
 
     def list_files(self, project_id: str) -> list[ProjectEntity]:
+        project_id = validate_project_id(project_id)
         self.session_manager.ensure_logged_in()
         logger.debug("Listing files for project %s via HTTP entities endpoint", project_id)
         result = self.session_manager.http.get(f"/project/{project_id}/entities")
@@ -435,6 +451,7 @@ class ProjectClient:
         ]
 
     def get_project_tree(self, project_id: str) -> dict[str, Any]:
+        project_id = validate_project_id(project_id)
         if project_id in self._tree_cache:
             return self._tree_cache[project_id]
 
@@ -463,6 +480,7 @@ class ProjectClient:
         )
 
     def get_root_doc(self, project_id: str) -> dict[str, str | None]:
+        project_id = validate_project_id(project_id)
         project = self.get_project_tree(project_id)
         root_doc_id = project.get("rootDoc_id")
         if not root_doc_id:
@@ -481,18 +499,20 @@ class ProjectClient:
         }
 
     def set_root_doc(self, project_id: str, path: str) -> dict[str, str | bool | None]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         if target.type != "doc":
             raise RuntimeError("set_root_doc currently only supports doc-type text files as the main compile target")
         if not target.entity_id:
             raise RuntimeError(f"Unable to find document ID: {path}")
+        root_doc_id = validate_entity_id(target.entity_id, "root_doc_id")
 
         logger.info("Setting root doc for project %s to %s", project_id, path)
         previous = self.get_root_doc(project_id)
         result = self._post_json_with_csrf(
             project_id=project_id,
             path=f"/project/{project_id}/settings",
-            payload={"rootDocId": target.entity_id},
+            payload={"rootDocId": root_doc_id},
             extra_headers={"Accept": "application/json"},
         )
         if result.status_code >= 400:
@@ -516,6 +536,9 @@ class ProjectClient:
         name: str,
         parent_folder_id: str | None = None,
     ) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
+        if parent_folder_id is not None:
+            parent_folder_id = validate_entity_id(parent_folder_id, "parent_folder_id")
         project = self.get_project_tree(project_id)
         root_folders = project.get("rootFolder", [])
         if not root_folders:
@@ -566,6 +589,9 @@ class ProjectClient:
         }
 
     def create_doc(self, project_id: str, name: str, parent_folder_id: str | None = None) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
+        if parent_folder_id is not None:
+            parent_folder_id = validate_entity_id(parent_folder_id, "parent_folder_id")
         project = self.get_project_tree(project_id)
         root_folders = project.get("rootFolder", [])
         if not root_folders:
@@ -629,18 +655,29 @@ class ProjectClient:
         allow_compat_variants: bool = False,
         return_attempt_trace: bool = False,
     ) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
+        if root_doc_id is not None:
+            resolved_root_doc_id = validate_entity_id(root_doc_id, "root_doc_id")
+        else:
+            project = self.get_project_tree(project_id)
+            project_root_doc_id = project.get("rootDoc_id")
+            if not isinstance(project_root_doc_id, str):
+                raise RuntimeError("Unable to determine rootDoc_id, cannot initiate compilation")
+            resolved_root_doc_id = validate_entity_id(project_root_doc_id, "rootDoc_id")
+
         cached = self._compile_cache.get(project_id)
         now = time.time()
-        params_key = (draft, check, stop_on_first_error, allow_compat_variants)
+        params_key = (resolved_root_doc_id, draft, check, stop_on_first_error, allow_compat_variants)
         if not force and cached is not None:
             cached_at, cached_payload, cached_params = cached
             if cached_params != params_key:
                 logger.debug("Compile cache params mismatch, ignoring cache")
             else:
                 cached_status = cached_payload.get("status")
-                cooldown_seconds = self._compile_backoff_seconds(cached_status, min_interval_seconds)
+                cached_status_text = cached_status if isinstance(cached_status, str) else None
+                cooldown_seconds = self._compile_backoff_seconds(cached_status_text, min_interval_seconds)
                 cooldown_status = {"too-recently-compiled", "compile-in-progress"}
-                if cached_status in cooldown_status and now - cached_at < cooldown_seconds:
+                if cached_status_text in cooldown_status and now - cached_at < cooldown_seconds:
                     reused: dict[str, object] = dict(cached_payload)
                     reused["cached"] = True
                     reused["cache_age_seconds"] = round(now - cached_at, 3)
@@ -649,11 +686,6 @@ class ProjectClient:
                     if return_attempt_trace and "attempt_trace" not in reused:
                         reused["attempt_trace"] = []
                     return reused
-
-        project = self.get_project_tree(project_id)
-        resolved_root_doc_id = root_doc_id or project.get("rootDoc_id")
-        if not resolved_root_doc_id:
-            raise RuntimeError("Unable to determine rootDoc_id, cannot initiate compilation")
 
         compile_variants = self._build_compile_variants(
             root_doc_id=resolved_root_doc_id,
@@ -667,7 +699,7 @@ class ProjectClient:
         attempts_made = 0
         attempt_trace: list[dict[str, object]] = []
         selected_variant_label: str | None = None
-        for variant_label, payload in compile_variants:
+        for variant_label, compile_request_payload in compile_variants:
             attempts = max(1, retry_on_500 + 1)
             for attempt in range(1, attempts + 1):
                 attempts_made += 1
@@ -679,7 +711,7 @@ class ProjectClient:
                 result = self._post_json_with_csrf(
                     project_id=project_id,
                     path=f"/project/{project_id}/compile",
-                    payload=payload,
+                    payload=compile_request_payload,
                     extra_headers={"Accept": "application/json"},
                 )
                 body_snippet = result.text.replace("\n", " ")[:200]
@@ -689,7 +721,7 @@ class ProjectClient:
                     "attempt_in_variant": attempt,
                     "status_code": result.status_code,
                     "duration_seconds": round(time.time() - started_at, 3),
-                    "payload": self._summarize_compile_payload(payload),
+                    "payload": self._summarize_compile_payload(compile_request_payload),
                     "body_snippet": body_snippet,
                 }
                 if result.status_code == 200:
@@ -740,7 +772,7 @@ class ProjectClient:
             }
 
         try:
-            payload: dict[str, object] = json.loads(result.text)
+            response_payload: dict[str, object] = json.loads(result.text)
         except json.JSONDecodeError:
             return {
                 "ok": False,
@@ -753,19 +785,24 @@ class ProjectClient:
                 "attempt_trace": attempt_trace if return_attempt_trace else None,
             }
 
-        payload["ok"] = True
-        payload["project_id"] = project_id
-        payload["rootDoc_id"] = resolved_root_doc_id
-        payload["attempts"] = attempts_made
-        payload["cached"] = False
-        payload["cooldown_seconds"] = self._compile_backoff_seconds(payload.get("status"), min_interval_seconds)
-        payload["selected_variant"] = selected_variant_label
+        response_payload["ok"] = True
+        response_payload["project_id"] = project_id
+        response_payload["rootDoc_id"] = resolved_root_doc_id
+        response_payload["attempts"] = attempts_made
+        response_payload["cached"] = False
+        response_status = response_payload.get("status")
+        response_payload["cooldown_seconds"] = self._compile_backoff_seconds(
+            response_status if isinstance(response_status, str) else None,
+            min_interval_seconds,
+        )
+        response_payload["selected_variant"] = selected_variant_label
         if return_attempt_trace:
-            payload["attempt_trace"] = attempt_trace
-        self._compile_cache[project_id] = (time.time(), copy.deepcopy(payload), params_key)
-        return payload
+            response_payload["attempt_trace"] = attempt_trace
+        self._compile_cache[project_id] = (time.time(), copy.deepcopy(response_payload), params_key)
+        return response_payload
 
     def stop_compile(self, project_id: str) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         logger.info("Stopping compile for project %s", project_id)
         result = self._post_json_with_csrf(
             project_id=project_id,
@@ -786,6 +823,7 @@ class ProjectClient:
         return response
 
     def clear_compile_output(self, project_id: str) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         logger.info("Clearing compile output for project %s", project_id)
         result = self._delete_with_csrf(
             project_id=project_id,
@@ -811,6 +849,7 @@ class ProjectClient:
         max_bytes: int = 200_000,
         trigger_compile_if_missing: bool = False,
     ) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         if compile_result is None:
             if not trigger_compile_if_missing:
                 return {
@@ -825,7 +864,8 @@ class ProjectClient:
             compile_payload = self.compile_project(project_id)
         else:
             compile_payload = compile_result
-        output_files = compile_payload.get("outputFiles") or []
+        output_files_payload = compile_payload.get("outputFiles")
+        output_files = output_files_payload if isinstance(output_files_payload, list) else []
         if not output_files:
             return {
                 "ok": False,
@@ -860,7 +900,11 @@ class ProjectClient:
 
         if isinstance(log_file, dict):
             try:
-                result["output_log"] = self._fetch_output_file_text(log_file, max_bytes=max_bytes)
+                result["output_log"] = self._fetch_output_file_text(
+                    log_file,
+                    compile_payload=compile_payload,
+                    max_bytes=max_bytes,
+                )
             except Exception as exc:
                 logger.warning("Failed to fetch output.log: %s", exc)
                 result["output_log"] = f"<error reading output.log: {exc}>"
@@ -869,7 +913,11 @@ class ProjectClient:
         for item in bib_logs:
             content: str | None
             try:
-                content = self._fetch_output_file_text(item, max_bytes=max_bytes)
+                content = self._fetch_output_file_text(
+                    item,
+                    compile_payload=compile_payload,
+                    max_bytes=max_bytes,
+                )
             except Exception as exc:
                 logger.warning("Failed to fetch bib log %s: %s", item.get("path"), exc)
                 content = f"<error reading {item.get('path')}: {exc}>"
@@ -889,6 +937,7 @@ class ProjectClient:
         max_bytes: int = 200_000,
         trigger_compile_if_missing: bool = False,
     ) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         logs_payload = self.get_compile_logs(
             project_id=project_id,
             compile_result=compile_result,
@@ -940,6 +989,7 @@ class ProjectClient:
         compile_result: dict[str, object] | None = None,
         trigger_compile_if_missing: bool = False,
     ) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         if compile_result is None:
             if not trigger_compile_if_missing:
                 return {
@@ -956,7 +1006,8 @@ class ProjectClient:
             compile_payload = self.compile_project(project_id)
         else:
             compile_payload = compile_result
-        output_files = compile_payload.get("outputFiles") or []
+        output_files_payload = compile_payload.get("outputFiles")
+        output_files = output_files_payload if isinstance(output_files_payload, list) else []
         if not output_files:
             return {
                 "ok": False,
@@ -974,7 +1025,7 @@ class ProjectClient:
             if not isinstance(item, dict):
                 continue
             try:
-                resolved_url = self._resolve_output_file_url(item)
+                resolved_url = self._resolve_output_file_url(item, compile_payload=compile_payload)
             except RuntimeError as exc:
                 logger.warning("Failed to resolve artifact URL for %s: %s", item.get("path"), exc)
                 resolved_url = None
@@ -1003,6 +1054,7 @@ class ProjectClient:
         output_path: str | None = None,
         trigger_compile_if_missing: bool = False,
     ) -> dict[str, object]:
+        project_id = validate_project_id(project_id)
         artifacts = self.get_compile_artifacts(
             project_id,
             compile_result,
@@ -1077,6 +1129,7 @@ class ProjectClient:
         }
 
     def list_files_with_ids(self, project_id: str) -> list[ProjectEntity]:
+        project_id = validate_project_id(project_id)
         project = self.get_project_tree(project_id)
         root_folders = project.get("rootFolder", [])
         collected: list[ProjectEntity] = []
@@ -1088,13 +1141,15 @@ class ProjectClient:
         return collected
 
     def read_file(self, project_id: str, path: str) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         logger.info("Reading file %s in project %s", path, project_id)
 
         if target.type == "doc":
             if not target.entity_id:
                 raise RuntimeError(f"Unable to find document ID: {path}")
-            result = self.session_manager.http.get(f"/project/{project_id}/doc/{target.entity_id}/download")
+            doc_id = validate_path_segment(target.entity_id, "doc_id")
+            result = self.session_manager.http.get(f"/project/{project_id}/doc/{doc_id}/download")
             if result.status_code != 200:
                 raise RuntimeError(f"Failed to read document, status code: {result.status_code}")
             return {
@@ -1115,6 +1170,7 @@ class ProjectClient:
     def download_file(
         self, project_id: str, path: str, output_path: str | None = None,
     ) -> dict[str, str | int | bool | None]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         logger.info("Downloading file %s from project %s", path, project_id)
         resolved_url: str
@@ -1122,22 +1178,24 @@ class ProjectClient:
         if target.type == "doc":
             if not target.entity_id:
                 raise RuntimeError(f"Unable to find document ID: {path}")
+            doc_id = validate_path_segment(target.entity_id, "doc_id")
             resolved_url = urljoin(
                 self.session_manager.config.base_url.rstrip("/") + "/",
-                f"project/{project_id}/doc/{target.entity_id}/download",
+                f"project/{project_id}/doc/{doc_id}/download",
             )
             binary_result = self.session_manager.http.get_bytes(
-                f"/project/{project_id}/doc/{target.entity_id}/download"
+                f"/project/{project_id}/doc/{doc_id}/download"
             )
         elif target.type == "fileRef":
             if not target.hash:
                 raise RuntimeError(f"Unable to find fileRef hash: {path}")
+            file_hash = validate_path_segment(target.hash, "file_hash")
             resolved_url = urljoin(
                 self.session_manager.config.base_url.rstrip("/") + "/",
-                f"project/{project_id}/blob/{target.hash}",
+                f"project/{project_id}/blob/{file_hash}",
             )
             binary_result = self.session_manager.http.get_bytes(
-                f"/project/{project_id}/blob/{target.hash}"
+                f"/project/{project_id}/blob/{file_hash}"
             )
         else:
             raise RuntimeError(f"Currently only doc and fileRef download is supported, got: {target.type}")
@@ -1178,6 +1236,7 @@ class ProjectClient:
         target_folder_path: str = "/",
         new_name: str | None = None,
     ) -> dict[str, str | int | bool | dict | list | None]:
+        project_id = validate_project_id(project_id)
         local_path = os.path.abspath(local_path)
         if not os.path.isfile(local_path):
             raise RuntimeError(f"Local file does not exist: {local_path}")
@@ -1275,6 +1334,7 @@ class ProjectClient:
         local_path: str,
         new_name: str | None = None,
     ) -> dict[str, str | int | bool | None]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         if target.type != "fileRef":
             raise RuntimeError("replace_file currently only supports replacing fileRef binary resources")
@@ -1336,6 +1396,8 @@ class ProjectClient:
             project_id=project_id,
             path=f"{parent_path}/{final_name}" if parent_path else f"/{final_name}",
         )
+        uploaded_bytes = uploaded_payload.get("bytes") if uploaded_payload else None
+        uploaded_bytes = uploaded_bytes if isinstance(uploaded_bytes, int) else None
 
         return {
             "ok": True,
@@ -1348,10 +1410,11 @@ class ProjectClient:
             "backup_deleted": delete_backup_error is None,
             "backup_delete_error": delete_backup_error,
             "rollback_failed": rollback_failed,
-            "uploaded_bytes": uploaded_payload.get("bytes") if uploaded_payload else None,
+            "uploaded_bytes": uploaded_bytes,
         }
 
     def write_file(self, project_id: str, path: str, content: str) -> dict[str, str | bool]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         if target.type != "doc":
             raise RuntimeError(
@@ -1378,7 +1441,7 @@ class ProjectClient:
         ]
         self.realtime_client.join_doc_and_apply_ot(
             project_id=project_id,
-            doc_id=target.entity_id,
+            doc_id=validate_path_segment(target.entity_id, "doc_id"),
             operations=operations,
         )
         self._invalidate_caches(project_id)
@@ -1391,6 +1454,8 @@ class ProjectClient:
         }
 
     def delete_entity(self, project_id: str, entity_type: str, entity_id: str) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
+        entity_id = validate_entity_id(entity_id)
         mapped_type = self._map_entity_type(entity_type)
         logger.info("Deleting entity %s (%s) from project %s", entity_id, entity_type, project_id)
         result = self._delete_with_csrf(
@@ -1408,18 +1473,20 @@ class ProjectClient:
         }
 
     def rename_entity(self, project_id: str, path: str, new_name: str) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
         if not new_name or "/" in new_name:
             raise RuntimeError("new_name is invalid: must not be empty and must not contain slashes")
 
         target = self._resolve_entity_by_path(project_id, path)
         if not target.entity_id:
             raise RuntimeError(f"Unable to find entity ID: {path}")
+        target_entity_id = validate_path_segment(target.entity_id, "entity_id")
 
         logger.info("Renaming %s → %s in project %s", path, new_name, project_id)
         mapped_type = self._map_entity_type(target.type)
         result = self._post_json_with_csrf(
             project_id=project_id,
-            path=f"/project/{project_id}/{mapped_type}/{target.entity_id}/rename",
+            path=f"/project/{project_id}/{mapped_type}/{target_entity_id}/rename",
             payload={"name": new_name},
             extra_headers={"Accept": "application/json"},
         )
@@ -1449,9 +1516,11 @@ class ProjectClient:
         }
 
     def move_entity(self, project_id: str, path: str, target_folder_path: str) -> dict[str, str]:
+        project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
         if not target.entity_id:
             raise RuntimeError(f"Unable to find entity ID: {path}")
+        target_entity_id = validate_path_segment(target.entity_id, "entity_id")
 
         destination_folder_id, normalized_folder_path = self._resolve_folder_id_by_path(
             project_id=project_id,
@@ -1461,7 +1530,7 @@ class ProjectClient:
         mapped_type = self._map_entity_type(target.type)
         result = self._post_json_with_csrf(
             project_id=project_id,
-            path=f"/project/{project_id}/{mapped_type}/{target.entity_id}/move",
+            path=f"/project/{project_id}/{mapped_type}/{target_entity_id}/move",
             payload={"folder_id": destination_folder_id},
             extra_headers={"Accept": "application/json"},
         )
@@ -1556,6 +1625,8 @@ class ProjectClient:
             )
 
     def _resolve_folder_path(self, project_id: str, folder_id: str) -> str:
+        project_id = validate_project_id(project_id)
+        folder_id = validate_path_segment(folder_id, "folder_id")
         entities = self.list_files_with_ids(project_id)
         target = next(
             (
@@ -1570,13 +1641,14 @@ class ProjectClient:
         return target.path
 
     def _resolve_folder_id_by_path(self, project_id: str, folder_path: str) -> tuple[str, str]:
+        project_id = validate_project_id(project_id)
         normalized = folder_path.strip() if folder_path else "/"
         if normalized in {"", "/"}:
             project = self.get_project_tree(project_id)
             root_folders = project.get("rootFolder", [])
             if not root_folders or not root_folders[0].get("_id"):
                 raise RuntimeError("Unable to determine rootFolder ID")
-            return root_folders[0]["_id"], ""
+            return validate_path_segment(root_folders[0]["_id"], "root_folder_id"), ""
 
         entities = self.list_files_with_ids(project_id)
         target = next(
@@ -1585,10 +1657,15 @@ class ProjectClient:
         )
         if target is None or not target.entity_id:
             raise RuntimeError(f"Target folder does not exist in project: {folder_path}")
-        return target.entity_id, target.path
+        return validate_path_segment(target.entity_id, "folder_id"), target.path
 
-    def _fetch_output_file_text(self, output_file: dict[str, Any], max_bytes: int) -> str:
-        file_url = self._resolve_output_file_url(output_file)
+    def _fetch_output_file_text(
+        self,
+        output_file: dict[str, Any],
+        compile_payload: dict[str, object],
+        max_bytes: int,
+    ) -> str:
+        file_url = self._resolve_output_file_url(output_file, compile_payload=compile_payload)
         logger.debug("Fetching output file %s (max %d bytes)", file_url, max_bytes)
         result = self.session_manager.http.get_absolute(file_url)
         if result.status_code != 200:
@@ -1597,14 +1674,49 @@ class ProjectClient:
             )
         return result.text[:max_bytes]
 
-    def _resolve_output_file_url(self, output_file: dict[str, Any]) -> str:
+    def _resolve_output_file_url(self, output_file: dict[str, Any], compile_payload: dict[str, object]) -> str:
         raw_url = output_file.get("url")
-        if not raw_url:
+        if not isinstance(raw_url, str) or not raw_url:
             raise RuntimeError("Compile output item missing url, unable to read log")
 
         parsed_base = urlparse(self.session_manager.config.base_url)
-        origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-        return urljoin(origin + "/", raw_url.lstrip("/"))
+        base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+        pdf_download_domain = compile_payload.get("pdfDownloadDomain")
+        if isinstance(pdf_download_domain, str) and pdf_download_domain.strip():
+            origin = self._normalize_download_domain(pdf_download_domain.strip(), default_scheme=parsed_base.scheme)
+        else:
+            origin = base_origin
+
+        resolved = raw_url if urlparse(raw_url).scheme else urljoin(origin.rstrip("/") + "/", raw_url.lstrip("/"))
+
+        clsi_server_id = compile_payload.get("clsiServerId") or compile_payload.get("clsiserverid")
+        if isinstance(clsi_server_id, str) and clsi_server_id:
+            resolved = self._add_query_param_if_missing(resolved, "clsiserverid", clsi_server_id)
+        return resolved
+
+    @staticmethod
+    def _normalize_download_domain(domain: str, default_scheme: str) -> str:
+        if domain.startswith("//"):
+            return f"{default_scheme}:{domain}".rstrip("/")
+        if not urlparse(domain).scheme:
+            return f"{default_scheme}://{domain.lstrip('/')}".rstrip("/")
+        return domain.rstrip("/")
+
+    @staticmethod
+    def _add_query_param_if_missing(url: str, key: str, value: str) -> str:
+        parsed = urlsplit(url)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(item_key == key for item_key, _ in query_items):
+            query_items.append((key, value))
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urlencode(query_items),
+                parsed.fragment,
+            )
+        )
 
     @staticmethod
     def _parse_compile_logs(logs_payload: dict[str, Any]) -> list[dict[str, object]]:
@@ -1879,7 +1991,10 @@ class ProjectClient:
             return
 
         for anchor in soup.find_all("a", href=True):
-            href = anchor.get("href", "")
+            raw_href = anchor.get("href", "")
+            if not isinstance(raw_href, str):
+                continue
+            href = raw_href
             project_id = _extract_project_id(href)
             if not project_id:
                 continue
@@ -1900,7 +2015,7 @@ class ProjectClient:
             return []
 
         raw_content = meta.get("content")
-        if not raw_content:
+        if not isinstance(raw_content, str) or not raw_content:
             return []
 
         try:
@@ -1911,9 +2026,15 @@ class ProjectClient:
         projects = payload.get("projects", [])
         results: list[ProjectSummary] = []
         for item in projects:
+            if not isinstance(item, dict):
+                continue
             project_id = item.get("id")
             name = item.get("name")
-            if not project_id or not name:
+            if not isinstance(project_id, str) or not isinstance(name, str):
+                continue
+            try:
+                project_id = validate_project_id(project_id)
+            except RuntimeError:
                 continue
 
             results.append(
@@ -1938,16 +2059,27 @@ class ProjectClient:
         if not content:
             return None
         try:
-            return json.loads(content)
+            return cast(dict[str, Any] | list[Any] | None, json.loads(content))
         except json.JSONDecodeError:
             return None
+
+    @staticmethod
+    def _read_meta_dict(soup: BeautifulSoup, name: str) -> dict[str, Any]:
+        payload = ProjectClient._read_meta_json(soup, name)
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _read_meta_list(soup: BeautifulSoup, name: str) -> list[Any]:
+        payload = ProjectClient._read_meta_json(soup, name)
+        return payload if isinstance(payload, list) else []
 
     @staticmethod
     def _read_meta_content(soup: BeautifulSoup, name: str) -> str | None:
         meta = soup.find("meta", attrs={"name": name})
         if not meta:
             return None
-        return meta.get("content")
+        content = meta.get("content")
+        return content if isinstance(content, str) else None
 
     @staticmethod
     def _extract_title(html: str) -> str | None:

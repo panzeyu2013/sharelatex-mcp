@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 
 from sharelatex_mcp.config import AppConfig
 from sharelatex_mcp.http import HttpClient
+from sharelatex_mcp.validation import validate_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,9 @@ class OverleafSessionManager:
         return not (300 <= home.status_code < 400 and "/login" in location)
 
     def get_csrf_token(self, project_id: str | None = None, force_refresh: bool = False) -> str:
+        if project_id is not None:
+            project_id = validate_project_id(project_id)
+
         if self._csrf_token and not force_refresh:
             return self._csrf_token
 

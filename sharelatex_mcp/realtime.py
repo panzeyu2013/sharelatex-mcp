@@ -10,6 +10,7 @@ import websocket
 
 from sharelatex_mcp.config import AppConfig
 from sharelatex_mcp.session import OverleafSessionManager
+from sharelatex_mcp.validation import validate_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class LegacySocketConnection:
     def __init__(self, config: AppConfig, session_manager: OverleafSessionManager, project_id: str) -> None:
         self.config = config
         self.session_manager = session_manager
-        self.project_id = project_id
+        self.project_id = validate_project_id(project_id)
         self.ws: websocket.WebSocket | None = None
 
     def __enter__(self) -> LegacySocketConnection:
@@ -263,6 +264,8 @@ class RealtimeProjectClient:
                         continue
                     if payload and payload[0] is not None:
                         raise RuntimeError(f"applyOtUpdate returned error: {payload[0]}")
+                    logger.debug("OT update acknowledged for doc %s", doc_id)
+                    return doc_data
                 if "otUpdateError" in message:
                     raise RuntimeError(f"applyOtUpdate failed: {message}")
 

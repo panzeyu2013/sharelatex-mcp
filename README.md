@@ -168,6 +168,8 @@ This creates `~/.config/sharelatex-mcp/config.json` and exits. Edit it with your
   "timeout_seconds": 15,
   // Set to true if you are using http:// instead of https://
   "allow_insecure_http": false,
+  // Optional project id used by destructive local validation scripts
+  "project_id": null,
   // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -182,6 +184,7 @@ Configuration fields:
 | `password` | Yes | Login password |
 | `timeout_seconds` | No | HTTP timeout in seconds. Default: `15` |
 | `allow_insecure_http` | No | Set `true` if you are using plain `http://` in a trusted local network |
+| `project_id` | No | Optional 24-character project id used by local validation scripts that modify a real project |
 | `log_level` | No | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. Default: `INFO` |
 
 ### 4. Smoke-test the connection
@@ -245,13 +248,18 @@ Your config file at `~/.config/sharelatex-mcp/config.json` is preserved across u
 ## 🧪 Validation Commands
 
 ```bash
+uv run pytest
 uv run python scripts/probe_login.py
 uv run python scripts/probe_projects.py
-uv run python scripts/test_mcp_tools.py
-uv run python scripts/test_write_roundtrip.py
-uv run python scripts/test_compile_roundtrip.py
-uv run python scripts/test_compile_diagnostics.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_mcp_tools.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 ```
+
+The `OVERLEAF_PROJECT_ID=...` prefix can be omitted if `project_id` is set in
+`~/.config/sharelatex-mcp/config.json`. Scripts that create, write, move,
+compile, or delete remote project content refuse to run without an explicit
+project id.
 
 ## 🗂️ Tool Overview
 
@@ -326,7 +334,8 @@ then this repository is built for that exact use case.
 
 - retry after refreshing the project state with `read_file`
 - confirm the target path is a `doc`, not a binary `fileRef`
-- if your instance is heavily customized, validate write behavior with `uv run python scripts/test_write_roundtrip.py`
+- if your instance is heavily customized, validate write behavior with
+  `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
 
 ## 🤝 Contributing
 

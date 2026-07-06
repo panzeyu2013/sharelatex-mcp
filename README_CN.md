@@ -155,6 +155,8 @@ sharelatex-mcp
   "timeout_seconds": 15,
   // 若使用 http:// 而非 https://，设为 true
   "allow_insecure_http": false,
+  // 供会修改真实项目的本地验证脚本使用的可选项目 ID
+  "project_id": null,
   // 日志级别：DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -169,6 +171,7 @@ sharelatex-mcp
 | `password` | 是 | 登录密码 |
 | `timeout_seconds` | 否 | HTTP 超时秒数，默认 `15` |
 | `allow_insecure_http` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
+| `project_id` | 否 | 供会修改真实项目的本地验证脚本使用的 24 位项目 ID |
 | `log_level` | 否 | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO` |
 
 ### 4. 先做连通性验证
@@ -232,13 +235,17 @@ uv tool install --reinstall /path/to/sharelatex-mcp
 ## 🧪 验证命令
 
 ```bash
+uv run pytest
 uv run python scripts/probe_login.py
 uv run python scripts/probe_projects.py
-uv run python scripts/test_mcp_tools.py
-uv run python scripts/test_write_roundtrip.py
-uv run python scripts/test_compile_roundtrip.py
-uv run python scripts/test_compile_diagnostics.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_mcp_tools.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 ```
+
+如果已经在 `~/.config/sharelatex-mcp/config.json` 中设置了 `project_id`，
+可以省略 `OVERLEAF_PROJECT_ID=...` 前缀。会创建、写入、移动、编译或删除
+远程项目内容的脚本，没有显式项目 ID 时会拒绝运行。
 
 ## 🗂️ 工具概览
 
@@ -337,7 +344,9 @@ uv run python scripts/test_compile_diagnostics.py
 
 - 先用 `read_file` 刷新一次当前文档状态后再试
 - 确认目标路径是 `doc`，不是二进制 `fileRef`
-- 如果你的实例做过较多自定义，先用 `uv run python scripts/test_write_roundtrip.py` 验证写入链路
+- 如果你的实例做过较多自定义，先用
+  `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
+  验证写入链路
 
 ## 🤝 参与开发
 

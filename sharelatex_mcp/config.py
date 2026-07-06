@@ -4,9 +4,13 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
+
+from sharelatex_mcp.validation import validate_project_id
 
 CONFIG_DIR = Path.home() / ".config" / "sharelatex-mcp"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 TEMPLATE = """\
 {
@@ -20,6 +24,8 @@ TEMPLATE = """\
   "timeout_seconds": 15,
   // Set to true if you are using http:// instead of https://
   "allow_insecure_http": false,
+  // Optional project id used by destructive local validation scripts
+  "project_id": null,
   // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -33,7 +39,8 @@ class AppConfig:
     password: str
     timeout_seconds: int
     allow_insecure_http: bool
-    log_level: str
+    project_id: str | None
+    log_level: LogLevel
 
 
 def _strip_json_comments(text: str) -> str:
@@ -88,6 +95,15 @@ def load_config() -> AppConfig:
             f"{CONFIG_FILE} to proceed."
         )
 
+    raw_project_id = data.get("project_id")
+    project_id = None
+    if raw_project_id is not None:
+        if not isinstance(raw_project_id, str):
+            raise RuntimeError("project_id must be a string or null")
+        project_id = raw_project_id.strip() or None
+        if project_id is not None:
+            project_id = validate_project_id(project_id)
+
     timeout_seconds = data.get("timeout_seconds", 15)
     if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
         raise RuntimeError("timeout_seconds must be an integer >= 1")
@@ -96,6 +112,7 @@ def load_config() -> AppConfig:
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     if log_level not in valid_levels:
         raise RuntimeError(f"Invalid log_level: {log_level!r}. Must be one of {valid_levels}")
+    typed_log_level = cast(LogLevel, log_level)
 
     return AppConfig(
         base_url=base_url,
@@ -103,5 +120,6 @@ def load_config() -> AppConfig:
         password=password,
         timeout_seconds=timeout_seconds,
         allow_insecure_http=bool(data.get("allow_insecure_http", False)),
-        log_level=log_level,
+        project_id=project_id,
+        log_level=typed_log_level,
     )

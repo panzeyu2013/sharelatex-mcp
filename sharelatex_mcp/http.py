@@ -8,6 +8,8 @@ from urllib.parse import urljoin
 import requests
 from requests.structures import CaseInsensitiveDict
 
+from sharelatex_mcp.validation import validate_http_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +50,7 @@ class HttpClient:
         logger.debug("HttpClient session closed")
 
     def _build_url(self, path: str) -> str:
+        validate_http_path(path)
         return urljoin(self.base_url, path.lstrip("/"))
 
     def _request_text(self, method: str, url: str, **kwargs: Any) -> HttpResult:
