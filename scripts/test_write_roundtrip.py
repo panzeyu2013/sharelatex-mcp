@@ -55,22 +55,18 @@ async def main() -> None:
     print("selected_project:")
     print(json.dumps(project, ensure_ascii=False, indent=2))
 
-    created = await server.call_tool("create_doc", {"project_id": project_id, "name": filename})
-    created_payload = _normalize_tool_result(created)[0]
-    path = created_payload["path"]
-    print("created:")
-    print(json.dumps(created_payload, ensure_ascii=False, indent=2))
+    path = f"/{filename}"
 
     try:
         write_result = await server.call_tool(
-            "write_file",
+            "write",
             {"project_id": project_id, "path": path, "content": content},
         )
-        print("\nwrite:")
+        print("\nwrite（创建+写入）:")
         print(json.dumps(_normalize_tool_result(write_result)[0], ensure_ascii=False, indent=2))
 
         read_result = await server.call_tool(
-            "read_file",
+            "read",
             {"project_id": project_id, "path": path},
         )
         read_payload = _normalize_tool_result(read_result)[0]

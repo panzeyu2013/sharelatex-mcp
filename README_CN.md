@@ -65,9 +65,9 @@
 
 ### 文本文件工作流
 
-- `read_file`
-- `write_file`
-- `create_doc`
+- `read`
+- `write`
+- `edit`
 - `create_folder`
 - `rename_entity`
 - `move_entity`
@@ -220,7 +220,7 @@ uv run python scripts/probe_projects.py
 1. 调用 `list_projects`
 2. 选择一个 `project_id`
 3. 调用 `list_files`
-4. 用 `read_file` 读取一个文档
+4. 用 `read` 读取一个文档
 5. 用 `compile_project` 触发编译
 6. 用 `analyze_compile_errors` 查看结构化问题
 
@@ -263,9 +263,9 @@ OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 
 ### 文本编辑
 
-- `read_file`
-- `write_file`
-- `create_doc`
+- `read`
+- `write`
+- `edit`
 - `create_folder`
 - `rename_entity`
 - `move_entity`
@@ -342,7 +342,7 @@ OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 
 ### realtime 写入失败
 
-- 先用 `read_file` 刷新一次当前文档状态后再试
+- 先用 `read` 刷新一次当前文档状态后再试
 - 确认目标路径是 `doc`，不是二进制 `fileRef`
 - 如果你的实例做过较多自定义，先用
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`

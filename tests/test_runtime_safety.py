@@ -3,14 +3,14 @@ from __future__ import annotations
 import json
 import time
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 from requests.structures import CaseInsensitiveDict
 
 import sharelatex_mcp.realtime as realtime_module
+from sharelatex_mcp.diff_engine import compute_diff_operations
 from sharelatex_mcp.http import HttpResult
-from sharelatex_mcp.projects import ProjectClient, ProjectEntity
+from sharelatex_mcp.projects import ProjectClient
 from sharelatex_mcp.validation import validate_http_path, validate_project_id
 
 
@@ -73,17 +73,20 @@ def test_compile_cache_key_includes_root_doc_id(monkeypatch: pytest.MonkeyPatch)
     assert result["rootDoc_id"] == root_b
 
 
-def test_realtime_apply_ot_success_ack_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_join_doc_write_applies_ot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """join_doc_write must correctly drain, joinDoc, diff, and apply OT."""
     messages = [
         "1::",
         "1::",
-        "6:::1+" + json.dumps([None, ["old"], 7, [], {}, "sharejs-text-ot"]),
+        "6:::1+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
         "6:::2+[]",
     ]
 
     class FakeConnection:
         def __init__(self, *args, **kwargs) -> None:
             self.sent = []
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _: None  # no-op for test
 
         def __enter__(self):
             return self
@@ -101,105 +104,42 @@ def test_realtime_apply_ot_success_ack_is_success(monkeypatch: pytest.MonkeyPatc
             for _ in range(expected_count):
                 self.recv()
 
+        def _send_locked(self, data: str) -> None:
+            pass  # no-op for test
+
     monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
     client = realtime_module.RealtimeProjectClient(
-        SimpleNamespace(),
+        SimpleNamespace(timeout_seconds=30),
         SimpleNamespace(),
     )
 
-    result = client.join_doc_and_apply_ot(
+    captured_content: list[str] = []
+
+    def diff_fn(content: str) -> list[dict[str, str | int]]:
+        captured_content.append(content)
+        return [{"p": 6, "i": "there "}]
+
+    client.join_doc_write(
         "0123456789abcdef01234567",
         "aaaaaaaaaaaaaaaaaaaaaaaa",
-        [{"p": 0, "i": "new"}],
+        diff_fn,
     )
 
-    assert result.version == 7
+    assert captured_content == ["hello world"]
 
 
-def test_write_file_uses_diff_operations(monkeypatch: pytest.MonkeyPatch) -> None:
-    """write_file must send diff-based OT ops, not full-replacement ops."""
-    client = _make_project_client()
-
-    captured_ops: list[list[dict[str, Any]]] = []
-
-    def fake_join_doc_and_apply_ot(
-        self: Any, project_id: str, doc_id: str, operations: list[dict[str, Any]]
-    ) -> Any:
-        captured_ops.append(operations)
-        return SimpleNamespace(version=1)
-
-    monkeypatch.setattr(
-        "sharelatex_mcp.realtime.RealtimeProjectClient.join_doc_and_apply_ot",
-        fake_join_doc_and_apply_ot,
-    )
-
-    def fake_resolve_entity_by_path(
-        project_id: str, path: str
-    ) -> ProjectEntity:
-        return ProjectEntity(path=path, type="doc", entity_id="doc123")
-
-    monkeypatch.setattr(client, "_resolve_entity_by_path", fake_resolve_entity_by_path)
-
-    def fake_read_file(
-        project_id: str, path: str
-    ) -> dict[str, str]:
-        return {"content": "hello world"}
-
-    monkeypatch.setattr(client, "read_file", fake_read_file)
-
-    result = client.write_file("0123456789abcdef01234567", "main.tex", "hello there world")
-
-    assert result["changed"] is True
-    assert captured_ops
+def test_write_uses_diff_operations() -> None:
+    """compute_diff_operations must produce minimal diff ops, not full replacement."""
+    result = compute_diff_operations("hello world", "hello there world")
     # Verify diff-based ops are used (not full replacement)
-    assert captured_ops[0] == [{"p": 6, "i": "there "}]
+    assert result == [{"p": 6, "i": "there "}]
 
 
-def test_write_file_falls_back_on_diff_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """write_file must fall back to full replacement when diff computation fails."""
-    client = _make_project_client()
-
-    captured_ops: list[list[dict[str, Any]]] = []
-
-    def fake_join_doc_and_apply_ot(
-        self: Any, project_id: str, doc_id: str, operations: list[dict[str, Any]]
-    ) -> Any:
-        captured_ops.append(operations)
-        return SimpleNamespace(version=1)
-
-    monkeypatch.setattr(
-        "sharelatex_mcp.realtime.RealtimeProjectClient.join_doc_and_apply_ot",
-        fake_join_doc_and_apply_ot,
-    )
-
-    def fake_resolve_entity_by_path(
-        project_id: str, path: str
-    ) -> ProjectEntity:
-        return ProjectEntity(path=path, type="doc", entity_id="doc123")
-
-    monkeypatch.setattr(client, "_resolve_entity_by_path", fake_resolve_entity_by_path)
-
-    def fake_read_file(
-        project_id: str, path: str
-    ) -> dict[str, str]:
-        return {"content": "hello world"}
-
-    monkeypatch.setattr(client, "read_file", fake_read_file)
-
-    # Simulate diff computation failure
-    def fake_diff_failure(old: str, new: str) -> list[dict[str, Any]]:
-        raise MemoryError("simulated diff failure")
-
-    monkeypatch.setattr(
-        "sharelatex_mcp.projects._compute_diff_operations",
-        fake_diff_failure,
-    )
-
-    result = client.write_file("0123456789abcdef01234567", "main.tex", "hello there world")
-
-    assert result["changed"] is True
-    assert captured_ops
-    assert captured_ops[0] == [
-        {"p": 0, "d": "hello world"},
-        {"p": 0, "i": "hello there world"},
-    ]
+def test_write_falls_back_to_full_replace_on_large_diff() -> None:
+    """compute_diff_operations must fall back to full replacement for near-total changes."""
+    # Two 50KB strings that differ in every position → pre-scan should trigger full-replace
+    old = "A" * 50000
+    new = "B" * 50000
+    result = compute_diff_operations(old, new)
+    # Full replacement: delete all of old, insert all of new
+    assert result == [{"p": 0, "d": old}, {"p": 0, "i": new}]

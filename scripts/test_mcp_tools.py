@@ -129,17 +129,17 @@ async def main() -> None:
     binary_file = next((item for item in file_payloads if item["type"] == "fileRef"), None)
     if tex_file:
         read_result = await server.call_tool(
-            "read_file",
+            "read",
             {"project_id": project_id, "path": tex_file["path"]},
         )
         read_payloads = _normalize_tool_result(read_result)
-        print("\nread_file 结果：")
+        print("\nread 结果：")
         snippet = dict(read_payloads[0])
         snippet["content"] = snippet["content"][:600]
         print(json.dumps(snippet, ensure_ascii=False, indent=2))
 
         write_result = await server.call_tool(
-            "write_file",
+            "write",
             {
                 "project_id": project_id,
                 "path": tex_file["path"],
@@ -147,7 +147,7 @@ async def main() -> None:
             },
         )
         write_payloads = _normalize_tool_result(write_result)
-        print("\nwrite_file（无变更自测）结果：")
+        print("\nwrite（无变更自测）结果：")
         print(json.dumps(write_payloads[0], ensure_ascii=False, indent=2))
 
         fd, temp_doc_download_path = tempfile.mkstemp(
@@ -396,21 +396,9 @@ async def main() -> None:
                 "\\end{document}\n"
             )
             write_probe_name = f".codex-mcp-write-{temp_suffix}.tex"
-            write_probe_result = await server.call_tool(
-                "create_doc",
-                {
-                    "project_id": project_id,
-                    "name": write_probe_name,
-                    "parent_folder_id": folder_b_payload["entity_id"],
-                },
-            )
-            write_probe_payload = _normalize_tool_result(write_probe_result)[0]
-            print("\ncreate_doc（write probe）结果：")
-            print(json.dumps(write_probe_payload, ensure_ascii=False, indent=2))
-
             write_probe_path = f"{folder_b_path}/{write_probe_name}"
             write_probe_write_result = await server.call_tool(
-                "write_file",
+                "write",
                 {
                     "project_id": project_id,
                     "path": write_probe_path,
@@ -418,51 +406,53 @@ async def main() -> None:
                 },
             )
             write_probe_write_payload = _normalize_tool_result(write_probe_write_result)[0]
-            print("\nwrite_file（真实写入）结果：")
+            print("\nwrite（创建+写入）结果：")
             print(json.dumps(write_probe_write_payload, ensure_ascii=False, indent=2))
 
             write_probe_read_result = await server.call_tool(
-                "read_file",
+                "read",
                 {
                     "project_id": project_id,
                     "path": write_probe_path,
                 },
             )
             write_probe_read_payload = _normalize_tool_result(write_probe_read_result)[0]
-            print("\nread_file（写入后回读）结果：")
+            print("\nread（写入后回读）结果：")
             read_probe_snippet = dict(write_probe_read_payload)
             read_probe_snippet["content"] = write_probe_read_payload["content"][:400]
             print(json.dumps(read_probe_snippet, ensure_ascii=False, indent=2))
             if write_probe_read_payload["content"] != write_probe_content:
-                raise RuntimeError("write_file 真实写入后回读内容不一致")
+                raise RuntimeError("write 真实写入后回读内容不一致")
         finally:
             if os.path.exists(temp_upload_input.name):
                 os.remove(temp_upload_input.name)
 
+        doc_path = f"{folder_a_renamed_path}/{doc_name}"
         doc_result = await server.call_tool(
-            "create_doc",
+            "write",
             {
                 "project_id": project_id,
-                "name": doc_name,
-                "parent_folder_id": folder_a_payload["entity_id"],
+                "path": doc_path,
+                "content": "",
             },
         )
         doc_payload = _normalize_tool_result(doc_result)[0]
-        print("\ncreate_doc（folder_a 内）结果：")
+        print("\nwrite（创建空文档，folder_a 内）结果：")
         print(json.dumps(doc_payload, ensure_ascii=False, indent=2))
 
         original_root_path = root_doc_payload.get("root_doc_path")
         if original_root_path:
+            temp_root_path = f"{folder_a_renamed_path}/{root_doc_name}"
             root_doc_temp_result = await server.call_tool(
-                "create_doc",
+                "write",
                 {
                     "project_id": project_id,
-                    "name": root_doc_name,
-                    "parent_folder_id": folder_a_payload["entity_id"],
+                    "path": temp_root_path,
+                    "content": "",
                 },
             )
             root_doc_temp_payload = _normalize_tool_result(root_doc_temp_result)[0]
-            print("\ncreate_doc（root doc temp）结果：")
+            print("\nwrite（创建 root doc temp）结果：")
             print(json.dumps(root_doc_temp_payload, ensure_ascii=False, indent=2))
 
             temp_root_path = f"{folder_a_renamed_path}/{root_doc_name}"

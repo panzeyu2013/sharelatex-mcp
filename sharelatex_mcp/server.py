@@ -5,6 +5,7 @@ from dataclasses import asdict
 from mcp.server.fastmcp import FastMCP
 
 from sharelatex_mcp.config import load_config
+from sharelatex_mcp.doc_editor import DocEditor
 from sharelatex_mcp.projects import ProjectClient
 from sharelatex_mcp.session import OverleafSessionManager
 
@@ -13,16 +14,21 @@ def create_server() -> FastMCP:
     config = load_config()
     session_manager = OverleafSessionManager(config)
     project_client = ProjectClient(session_manager)
+    doc_editor = DocEditor(project_client)
 
     mcp = FastMCP(
         name="sharelatex-mcp",
         instructions=(
             "MCP server for self-hosted ShareLaTeX/Overleaf. "
             "Supports email login, project CRUD, file upload/download/replace, "
-            "doc text read/write, and compile workflows."
+            "doc text read/write/edit, and compile workflows."
         ),
         log_level=config.log_level,
     )
+
+    # ==================================================================
+    # Project management
+    # ==================================================================
 
     @mcp.tool(
         name="list_projects",
@@ -72,6 +78,10 @@ def create_server() -> FastMCP:
     def set_root_doc(project_id: str, path: str) -> dict:
         return project_client.set_root_doc(project_id, path)
 
+    # ==================================================================
+    # File listing & reading
+    # ==================================================================
+
     @mcp.tool(
         name="list_files",
         description=(
@@ -84,14 +94,23 @@ def create_server() -> FastMCP:
         return [asdict(entity) for entity in entities]
 
     @mcp.tool(
-        name="read_file",
+        name="read",
         description=(
-            "Read text content of a doc-type file (.tex, .bib, .sty, etc.). "
-            "Path must start with / and match the project-internal path."
+            "Read text content of a doc-type file (.tex, .bib, .sty, etc.) "
+            "with optional line-range slicing. Returns line-numbered content. "
+            "Use offset/limit for large files. "
+            "Path must start with / and match the project-internal path. "
+            "For binary files use download_file."
         ),
     )
-    def read_file(project_id: str, path: str) -> dict:
-        return project_client.read_file(project_id, path)
+    def read(
+        project_id: str,
+        path: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> dict:
+        return doc_editor.read(project_id, path, offset=offset, limit=limit)
+
 
     @mcp.tool(
         name="download_file",
@@ -102,6 +121,10 @@ def create_server() -> FastMCP:
     )
     def download_file(project_id: str, path: str, output_path: str | None = None) -> dict:
         return project_client.download_file(project_id, path, output_path)
+
+    # ==================================================================
+    # File upload & replace
+    # ==================================================================
 
     @mcp.tool(
         name="upload_file",
@@ -144,26 +167,41 @@ def create_server() -> FastMCP:
             new_name=new_name,
         )
 
-    @mcp.tool(
-        name="write_file",
-        description=(
-            "Write content to a doc-type text file. Uses socket.io + "
-            "sharejs-text-ot to apply minimal character-level diffs. "
-            "Skips if content is unchanged."
-        ),
-    )
-    def write_file(project_id: str, path: str, content: str) -> dict:
-        return project_client.write_file(project_id, path, content)
+    # ==================================================================
+    # Write & edit
+    # ==================================================================
 
     @mcp.tool(
-        name="create_doc",
+        name="write",
         description=(
-            "Create a new doc file in a project. "
-            "Defaults to root; use parent_folder_id to specify a subfolder."
+            "Write content to a doc-type text file. Auto-creates the file if "
+            "it does not already exist. Uses socket.io + sharejs-text-ot to "
+            "apply minimal character-level diffs. For binary files use "
+            "upload_file or replace_file."
         ),
     )
-    def create_doc(project_id: str, name: str, parent_folder_id: str | None = None) -> dict:
-        return project_client.create_doc(project_id, name, parent_folder_id)
+    def write(project_id: str, path: str, content: str) -> dict:
+        return doc_editor.write(project_id, path, content)
+
+    @mcp.tool(
+        name="edit",
+        description=(
+            "Apply precise find-and-replace edits to a doc-type text file. "
+            "Each edit has 'old' (text to find, must match exactly one location) "
+            "and 'new' (replacement text). Multiple edits are applied atomically "
+            "in a single operation. For full-file writes use 'write' instead."
+        ),
+    )
+    def edit(
+        project_id: str,
+        path: str,
+        edits: list[dict[str, str]],
+    ) -> dict:
+        return doc_editor.edit(project_id, path, edits)
+
+    # ==================================================================
+    # File CRUD
+    # ==================================================================
 
     @mcp.tool(
         name="create_folder",
@@ -204,6 +242,10 @@ def create_server() -> FastMCP:
     )
     def move_entity(project_id: str, path: str, target_folder_path: str) -> dict:
         return project_client.move_entity(project_id, path, target_folder_path)
+
+    # ==================================================================
+    # Compile chain
+    # ==================================================================
 
     @mcp.tool(
         name="compile_project",

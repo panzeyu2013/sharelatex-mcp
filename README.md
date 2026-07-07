@@ -58,9 +58,9 @@ This repository is built for teams who want MCP to operate on the actual self-ho
 
 ### Text workflows
 
-- `read_file`
-- `write_file`
-- `create_doc`
+- `read`
+- `write`
+- `edit`
 - `create_folder`
 - `rename_entity`
 - `move_entity`
@@ -233,7 +233,7 @@ Once connected, a good first sequence is:
 1. Call `list_projects`
 2. Pick a `project_id`
 3. Call `list_files`
-4. Read a doc with `read_file`
+4. Read a doc with `read`
 5. Trigger a compile with `compile_project`
 6. Inspect issues with `analyze_compile_errors`
 
@@ -277,9 +277,9 @@ project id.
 
 ### Text editing
 
-- `read_file`
-- `write_file`
-- `create_doc`
+- `read`
+- `write`
+- `edit`
 - `create_folder`
 - `rename_entity`
 - `move_entity`
@@ -332,7 +332,7 @@ then this repository is built for that exact use case.
 
 ### Realtime write errors
 
-- retry after refreshing the project state with `read_file`
+- retry after refreshing the project state with `read`
 - confirm the target path is a `doc`, not a binary `fileRef`
 - if your instance is heavily customized, validate write behavior with
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from sharelatex_mcp.projects import _compute_diff_operations
+from sharelatex_mcp.diff_engine import compute_diff_operations
 
 
 def _apply_ops(text: str, ops: list[dict[str, Any]]) -> str:
@@ -63,7 +63,7 @@ def _apply_ops(text: str, ops: list[dict[str, Any]]) -> str:
 ])
 def test_roundtrip_apply_ops_matches_new(old: str, new: str) -> None:
     """Applying generated ops to old text must produce new text."""
-    ops = _compute_diff_operations(old, new)
+    ops = compute_diff_operations(old, new)
     assert _apply_ops(old, ops) == new
 
 
@@ -92,7 +92,7 @@ def test_roundtrip_randomized() -> None:
                     replace_len = rng.randint(1, min(3, len(chars) - pos))
                     chars[pos:pos + replace_len] = [rng.choice(alphabet) for _ in range(replace_len)]
             new = "".join(chars)
-            ops = _compute_diff_operations(old, new)
+            ops = compute_diff_operations(old, new)
             assert _apply_ops(old, ops) == new, (
                 f"Roundtrip failed [{phase}#{i}]:\n  old={old!r}\n  new={new!r}\n  ops={ops}"
             )
@@ -113,7 +113,7 @@ def test_roundtrip_randomized() -> None:
 ])
 def test_fixed_expected_ops(old: str, new: str, expected: list[dict[str, Any]]) -> None:
     """Exact operation sequences for simple, non-ambiguous scenarios."""
-    ops = _compute_diff_operations(old, new)
+    ops = compute_diff_operations(old, new)
     assert ops == expected
 
 
@@ -124,7 +124,7 @@ def test_large_file_single_char_change() -> None:
     """500KB file with single character change must complete quickly."""
     old = "x" * 500_000
     new = old[:250_000] + "y" + old[250_001:]
-    ops = _compute_diff_operations(old, new)
+    ops = compute_diff_operations(old, new)
     assert _apply_ops(old, ops) == new
 
 
@@ -133,5 +133,5 @@ def test_large_file_full_replacement_performance() -> None:
     """Diff on wholly different large inputs must complete and be correct."""
     old = "line " + "x" * 500_000
     new = "line " + "y" * 500_000
-    ops = _compute_diff_operations(old, new)
+    ops = compute_diff_operations(old, new)
     assert _apply_ops(old, ops) == new

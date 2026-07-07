@@ -14,7 +14,6 @@ from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
-from diff_match_patch import diff_match_patch  # package: diff-match-patch (PyPI)
 from websocket import WebSocketConnectionClosedException
 
 from sharelatex_mcp.http import HttpResult
@@ -28,38 +27,6 @@ from sharelatex_mcp.validation import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _compute_diff_operations(old: str, new: str) -> list[dict[str, Any]]:
-    """Compute minimal sharejs-text-ot operations from old to new content.
-
-    Uses Myers diff algorithm (via diff-match-patch) for guaranteed minimal
-    edit distance.  Returns a list of operations that can be sent as a batch
-    to ``applyOtUpdate``.  Each operation's position is correct for sequential
-    application by the ShareJS OT engine.
-    """
-    if old == new:
-        return []
-
-    dmp = diff_match_patch()
-    diffs = dmp.diff_main(old, new)
-    dmp.diff_cleanupMerge(diffs)
-
-    ops: list[dict[str, Any]] = []
-    position = 0
-
-    for op, text in diffs:
-        if not text:
-            continue
-        if op == 0:  # EQUAL
-            position += len(text)
-        elif op == -1:  # DELETE
-            ops.append({"p": position, "d": text})
-        elif op == 1:  # INSERT
-            ops.append({"p": position, "i": text})
-            position += len(text)
-
-    return ops
 
 
 @dataclass
@@ -621,59 +588,6 @@ class ProjectClient:
             "path": folder_path,
         }
 
-    def create_doc(self, project_id: str, name: str, parent_folder_id: str | None = None) -> dict[str, str]:
-        project_id = validate_project_id(project_id)
-        if parent_folder_id is not None:
-            parent_folder_id = validate_entity_id(parent_folder_id, "parent_folder_id")
-        project = self.get_project_tree(project_id)
-        root_folders = project.get("rootFolder", [])
-        if not root_folders:
-            raise RuntimeError("Project missing rootFolder, unable to create document")
-
-        target_folder_id = parent_folder_id or root_folders[0].get("_id")
-        if not target_folder_id:
-            raise RuntimeError("Unable to determine target parent folder ID")
-
-        parent_path = self._resolve_folder_path(project_id, target_folder_id)
-        logger.info("Creating doc '%s' in project %s (parent: %s)", name, project_id, target_folder_id)
-        result = self._post_json_with_csrf(
-            project_id=project_id,
-            path=f"/project/{project_id}/doc",
-            payload={
-                "parent_folder_id": target_folder_id,
-                "name": name,
-            },
-            extra_headers={"Accept": "application/json"},
-        )
-        if result.status_code >= 400:
-            raise RuntimeError(f"Failed to create document, status code: {result.status_code}")
-
-        try:
-            payload = json.loads(result.text)
-        except json.JSONDecodeError as err:
-            raise RuntimeError("Failed to create document: invalid JSON response") from err
-
-        entity_id = payload.get("_id")
-        if not entity_id:
-            raise RuntimeError("Document created but no document ID returned")
-
-        doc_path = f"{parent_path}/{name}" if parent_path else f"/{name}"
-        self._cache_upsert(
-            project_id,
-            ProjectEntity(
-                path=doc_path,
-                type="doc",
-                entity_id=entity_id,
-                parent_folder_id=target_folder_id,
-            ),
-        )
-        self._invalidate_caches(project_id)
-        return {
-            "project_id": project_id,
-            "entity_id": entity_id,
-            "path": doc_path,
-        }
-
     def compile_project(
         self,
         project_id: str,
@@ -1173,33 +1087,6 @@ class ProjectClient:
         self._cache_entities(project_id, collected)
         return collected
 
-    def read_file(self, project_id: str, path: str) -> dict[str, str]:
-        project_id = validate_project_id(project_id)
-        target = self._resolve_entity_by_path(project_id, path)
-        logger.info("Reading file %s in project %s", path, project_id)
-
-        if target.type == "doc":
-            if not target.entity_id:
-                raise RuntimeError(f"Unable to find document ID: {path}")
-            doc_id = validate_path_segment(target.entity_id, "doc_id")
-            result = self.session_manager.http.get(f"/project/{project_id}/doc/{doc_id}/download")
-            if result.status_code != 200:
-                raise RuntimeError(f"Failed to read document, status code: {result.status_code}")
-            return {
-                "project_id": project_id,
-                "path": path,
-                "type": target.type,
-                "content": result.text,
-            }
-
-        if target.type == "fileRef":
-            raise RuntimeError(
-                "Reading binary fileRef content as text is not supported in the current version. "
-                "Please use download_file for binary resources."
-            )
-
-        raise RuntimeError(f"Unsupported file type: {target.type}")
-
     def download_file(
         self, project_id: str, path: str, output_path: str | None = None,
     ) -> dict[str, str | int | bool | None]:
@@ -1444,60 +1331,6 @@ class ProjectClient:
             "backup_delete_error": delete_backup_error,
             "rollback_failed": rollback_failed,
             "uploaded_bytes": uploaded_bytes,
-        }
-
-    def write_file(self, project_id: str, path: str, content: str) -> dict[str, str | bool]:
-        project_id = validate_project_id(project_id)
-        target = self._resolve_entity_by_path(project_id, path)
-        if target.type != "doc":
-            raise RuntimeError(
-                "Only doc-type text files can be written in the current version. "
-                "For binary resources, use upload_file or replace_file."
-            )
-        if not target.entity_id:
-            raise RuntimeError(f"Unable to find document ID: {path}")
-
-        current = self.read_file(project_id, path)["content"]
-        if current == content:
-            return {
-                "project_id": project_id,
-                "path": path,
-                "changed": False,
-                "message": "File content unchanged, skipped write",
-            }
-
-        try:
-            operations = _compute_diff_operations(current, content)
-        except Exception:
-            logger.exception("Diff computation failed, falling back to full replacement")
-            operations = [{"p": 0, "d": current}, {"p": 0, "i": content}]
-
-        logger.info(
-            "Writing to %s in project %s (diff: %d ops, was %d chars, now %d chars)",
-            path, project_id, len(operations), len(current), len(content),
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            op_count = len(operations)
-            if op_count <= 50:
-                logger.debug("Diff operations for %s: %s", path, operations)
-            else:
-                logger.debug(
-                    "Diff operations for %s: %d ops (first 10: %s)",
-                    path, op_count, operations[:10],
-                )
-
-        self.realtime_client.join_doc_and_apply_ot(
-            project_id=project_id,
-            doc_id=validate_path_segment(target.entity_id, "doc_id"),
-            operations=operations,
-        )
-        self._invalidate_caches(project_id)
-        logger.debug("Write operation sent for %s in project %s (diff: %d ops)", path, project_id, len(operations))
-        return {
-            "project_id": project_id,
-            "path": path,
-            "changed": True,
-            "message": "Write operation sent",
         }
 
     def delete_entity(self, project_id: str, entity_type: str, entity_id: str) -> dict[str, str]:
