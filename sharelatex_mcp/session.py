@@ -75,7 +75,7 @@ class OverleafSessionManager:
     def is_logged_in(self) -> bool:
         try:
             home = self.http.get("/project")
-        except (requests.ConnectionError, requests.Timeout, RuntimeError):
+        except (requests.ConnectionError, requests.Timeout):
             logger.debug("Network error checking login status", exc_info=True)
             return False
         if home.status_code >= 500:

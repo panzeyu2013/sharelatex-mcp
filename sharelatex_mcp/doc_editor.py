@@ -366,6 +366,9 @@ class DocEditor:
         except json.JSONDecodeError as exc:
             raise RuntimeError("Failed to create document: invalid JSON response") from exc
 
+        if not isinstance(payload, dict):
+            raise RuntimeError("Failed to create document: unexpected response format")
+
         entity_id = payload.get("_id")
         if not entity_id:
             raise RuntimeError("Document created but no document ID returned")

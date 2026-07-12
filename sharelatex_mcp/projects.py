@@ -440,6 +440,9 @@ class ProjectClient:
         except json.JSONDecodeError as err:
             raise RuntimeError("Failed to parse project file tree: invalid JSON response") from err
 
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected response format from entities endpoint")
+
         entities = payload.get("entities", [])
         return [
             ProjectEntity(
@@ -447,7 +450,7 @@ class ProjectClient:
                 type=entity["type"],
             )
             for entity in entities
-            if "path" in entity and "type" in entity
+            if isinstance(entity, dict) and "path" in entity and "type" in entity
         ]
 
     def get_project_tree(self, project_id: str) -> dict[str, Any]:
@@ -544,7 +547,9 @@ class ProjectClient:
         if not root_folders:
             raise RuntimeError("Project missing rootFolder, unable to create folder")
 
-        target_folder_id = parent_folder_id or root_folders[0].get("_id")
+        target_folder_id = parent_folder_id or (
+            root_folders[0].get("_id") if isinstance(root_folders[0], dict) else None
+        )
         if not target_folder_id:
             raise RuntimeError("Unable to determine target parent folder ID")
 
@@ -566,6 +571,9 @@ class ProjectClient:
             payload = json.loads(result.text)
         except json.JSONDecodeError as err:
             raise RuntimeError("Failed to create folder: invalid JSON response") from err
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Failed to create folder: unexpected response format")
 
         entity_id = payload.get("_id")
         if not entity_id:
@@ -673,7 +681,8 @@ class ProjectClient:
                 }
                 if result.status_code == 200:
                     try:
-                        trace_entry["response_status"] = json.loads(result.text).get("status")
+                        parsed = json.loads(result.text)
+                        trace_entry["response_status"] = parsed.get("status") if isinstance(parsed, dict) else None
                     except json.JSONDecodeError:
                         trace_entry["response_status"] = "non-json-200"
                 attempt_trace.append(trace_entry)
@@ -691,7 +700,8 @@ class ProjectClient:
             if result is not None and result.status_code == 200:
                 if allow_compat_variants:
                     try:
-                        response_status = json.loads(result.text).get("status")
+                        parsed = json.loads(result.text)
+                        response_status = parsed.get("status") if isinstance(parsed, dict) else None
                     except json.JSONDecodeError:
                         response_status = None
                     if response_status not in ("success",):
@@ -732,6 +742,18 @@ class ProjectClient:
                 "attempt_trace": attempt_trace if return_attempt_trace else None,
             }
 
+        if not isinstance(response_payload, dict):
+            return {
+                "ok": False,
+                "project_id": project_id,
+                "rootDoc_id": resolved_root_doc_id,
+                "status_code": result.status_code,
+                "body_snippet": result.text[:500],
+                "message": "Compile endpoint returned an unexpected JSON type",
+                "selected_variant": selected_variant_label,
+                "attempt_trace": attempt_trace if return_attempt_trace else None,
+            }
+
         response_payload["ok"] = True
         response_payload["project_id"] = project_id
         response_payload["rootDoc_id"] = resolved_root_doc_id
@@ -764,7 +786,8 @@ class ProjectClient:
             "status_code": result.status_code,
         }
         try:
-            response["payload"] = json.loads(result.text) if result.text else {}
+            raw = json.loads(result.text) if result.text else None
+            response["payload"] = raw if isinstance(raw, (dict, list)) else {}
         except json.JSONDecodeError:
             response["body_snippet"] = result.text[:500]
         return response
@@ -784,7 +807,8 @@ class ProjectClient:
             "status_code": result.status_code,
         }
         try:
-            response["payload"] = json.loads(result.text) if result.text else {}
+            raw = json.loads(result.text) if result.text else None
+            response["payload"] = raw if isinstance(raw, (dict, list)) else {}
         except json.JSONDecodeError:
             response["body_snippet"] = result.text[:500]
         return response
@@ -1081,6 +1105,8 @@ class ProjectClient:
         root_folders = project.get("rootFolder", [])
         collected: list[ProjectEntity] = []
         for folder in root_folders:
+            if not isinstance(folder, dict):
+                continue
             self._collect_entities_from_folder(
                 folder=folder, parent_path="", parent_folder_id=None, output=collected,
             )
@@ -1468,6 +1494,8 @@ class ProjectClient:
                 )
 
         for doc in folder.get("docs", []):
+            if not isinstance(doc, dict):
+                continue
             doc_name = doc.get("name")
             if not doc_name:
                 continue
@@ -1482,6 +1510,8 @@ class ProjectClient:
             )
 
         for file_ref in folder.get("fileRefs", []):
+            if not isinstance(file_ref, dict):
+                continue
             file_name = file_ref.get("name")
             if not file_name:
                 continue
@@ -1497,6 +1527,8 @@ class ProjectClient:
             )
 
         for child_folder in folder.get("folders", []):
+            if not isinstance(child_folder, dict):
+                continue
             self._collect_entities_from_folder(
                 folder=child_folder,
                 parent_path=folder_path,
@@ -1526,7 +1558,7 @@ class ProjectClient:
         if normalized in {"", "/"}:
             project = self.get_project_tree(project_id)
             root_folders = project.get("rootFolder", [])
-            if not root_folders or not root_folders[0].get("_id"):
+            if not root_folders or not isinstance(root_folders[0], dict) or not root_folders[0].get("_id"):
                 raise RuntimeError("Unable to determine rootFolder ID")
             return validate_path_segment(root_folders[0]["_id"], "root_folder_id"), ""
 
@@ -1901,6 +1933,9 @@ class ProjectClient:
         try:
             payload = json.loads(html.unescape(raw_content))
         except json.JSONDecodeError:
+            return []
+
+        if not isinstance(payload, dict):
             return []
 
         projects = payload.get("projects", [])

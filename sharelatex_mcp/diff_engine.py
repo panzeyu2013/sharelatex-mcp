@@ -130,30 +130,83 @@ def _likely_full_replace(old: str, new: str) -> bool:
 
 
 def convert_ot_positions_to_utf16(operations: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
-    """Convert all ``p`` fields in *operations* from Python code-point offsets
-    to JS UTF-16 code-unit offsets.
+    """Convert all ``p`` fields from code-point to UTF-16 code-unit offsets.
 
-    *text* must be the same string that was passed as *old* to
-    ``compute_diff_operations`` (i.e. the Overleaf raw content, not NFC-
-    normalised — see design doc §5.2 and §7.1).
+    Operations are applied **sequentially** in sharejs-text-ot: each
+    operation's position is relative to the document state after all
+    previous operations.  This function correctly handles sequential
+    positions by simulating each operation's effect on the text.
 
-    Uses ``array('I')`` instead of ``list[int]`` to keep memory low (~8 MB
-    for a 2 MB file instead of ~72 MB).
+    For large diffs we degrade to an estimation-based path
+    (1 code-point ≈ 1 UTF-16 code-unit for positions beyond the
+    original text), which is exact for ASCII and a safe approximation
+    for the mixed case.
     """
     if not operations:
         return operations
 
-    # Build code-point → UTF-16 offset lookup table
-    offsets = array("I", [0]) * (len(text) + 1)
+    # Pre-compute UTF-16 offset map for the original text
+    orig_offsets = array("I", [0]) * (len(text) + 1)
     off = 0
     for i, ch in enumerate(text):
         off += 1 if ord(ch) <= 0xFFFF else 2
-        offsets[i + 1] = off
+        orig_offsets[i + 1] = off
 
+    # When the text-and-operations product is small, use the exact
+    # sequential-simulation path.  Otherwise fall back to the fast
+    # estimate path, which is still safe (it will never IndexError).
+    use_exact = (len(text) * len(operations)) <= 500_000
+
+    if use_exact:
+        return _convert_sequential_exact(operations, text)
+    else:
+        return _convert_estimate(operations, orig_offsets, text, off)
+
+
+def _convert_sequential_exact(operations: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    """Exact sequential-simulation path — correct for every input, O(n*m)."""
+    current_text = text
+    for op in operations:
+        p = op["p"]
+        limit = min(p, len(current_text))
+        utf16_p = 0
+        for i in range(limit):
+            utf16_p += 1 if ord(current_text[i]) <= 0xFFFF else 2
+        if p > len(current_text):
+            utf16_p += (p - len(current_text))
+        op["p"] = utf16_p
+        if "d" in op:
+            current_text = current_text[:p] + current_text[p + len(op["d"]):]
+        elif "i" in op:
+            current_text = current_text[:p] + op["i"] + current_text[p:]
+    return operations
+
+
+def _convert_estimate(
+    operations: list[dict[str, Any]],
+    orig_offsets: array[int],
+    text: str,
+    total_utf16: int,
+) -> list[dict[str, Any]]:
+    """Estimation path — expand lookup to max position, estimate beyond text."""
+    max_pos = len(text)
+    for op in operations:
+        if "p" in op and op["p"] > max_pos:
+            max_pos = op["p"]
+    if max_pos > len(text):
+        offsets = array("I", [0]) * (max_pos + 1)
+        for i in range(len(text) + 1):
+            offsets[i] = orig_offsets[i]
+        for pos in range(len(text) + 1, max_pos + 1):
+            offsets[pos] = total_utf16 + (pos - len(text))
+        for op in operations:
+            if "p" in op:
+                op["p"] = offsets[op["p"]]
+        return operations
+    # max_pos == len(text): reuse precomputed table
     for op in operations:
         if "p" in op:
-            op["p"] = offsets[op["p"]]
-
+            op["p"] = orig_offsets[op["p"]]
     return operations
 
 

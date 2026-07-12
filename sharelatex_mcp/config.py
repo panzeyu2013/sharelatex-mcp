@@ -75,6 +75,9 @@ def load_config() -> AppConfig:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Invalid JSON in {CONFIG_FILE}: {exc}") from exc
 
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Config file must contain a JSON object, got {type(data).__name__}")
+
     base_url = data.get("base_url", "").rstrip("/")
     if not base_url:
         raise RuntimeError(f"Missing required field 'base_url' in {CONFIG_FILE}")
@@ -105,8 +108,9 @@ def load_config() -> AppConfig:
             project_id = validate_project_id(project_id)
 
     timeout_seconds = data.get("timeout_seconds", 15)
-    if not isinstance(timeout_seconds, int) or timeout_seconds < 1:
-        raise RuntimeError("timeout_seconds must be an integer >= 1")
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 1:
+        raise RuntimeError("timeout_seconds must be a number >= 1")
+    timeout_seconds = int(timeout_seconds)
 
     log_level = data.get("log_level", "INFO").upper()
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
