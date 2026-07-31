@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
   "beautifulsoup4>=4.12.3",
   "diff-match-patch>=20241021,<20260000",
-  "mcp>=1.9.4",
+  "mcp>=1.9.4,<2.0.0",
   "requests>=2.32.3",
   "websocket-client>=1.9.0"
 ]
