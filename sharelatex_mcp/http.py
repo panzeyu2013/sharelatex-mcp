@@ -88,6 +88,9 @@ class HttpClient:
     def get_absolute(self, absolute_url: str, **kwargs: Any) -> HttpResult:
         return self._request_text(
             "GET", absolute_url,
+            # Redirects are intentionally not followed: the resolved compile
+            # output URL has already been origin-allowlisted, and following a
+            # redirect could silently reach an untrusted host (SSRF).
             timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 

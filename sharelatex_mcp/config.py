@@ -74,9 +74,10 @@ def _ensure_config_file() -> None:
 def _secure_config_file_permissions() -> None:
     if os.name != "posix":
         return
-    if CONFIG_FILE.is_symlink():
-        raise RuntimeError(f"Config file must not be a symbolic link: {CONFIG_FILE}")
-    CONFIG_FILE.chmod(0o600)
+    # Resolve symlinks so dotfiles/chezmoi/Nix setups that link the config into
+    # the expected location still work; the permissions are applied to the real
+    # file holding the credentials.
+    CONFIG_FILE.resolve().chmod(0o600)
 
 
 def load_config() -> AppConfig:

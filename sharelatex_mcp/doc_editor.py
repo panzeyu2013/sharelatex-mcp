@@ -16,9 +16,9 @@ from sharelatex_mcp.diff_engine import (
     MAX_FILE_SIZE,
     MAX_NEW_LENGTH,
     MAX_OLD_LENGTH,
+    _compute_edit_operations,
     check_edits_already_applied,
     compute_diff_operations,
-    compute_edit_operations,
     convert_ot_positions_to_utf16,
 )
 from sharelatex_mcp.errors import (
@@ -222,15 +222,7 @@ class DocEditor:
         expected_content: list[str | None] = [None]
 
         def _diff_fn(current: str) -> list[dict[str, Any]]:
-            ops = compute_edit_operations(current, edits)
-            modified = current
-            for op in ops:
-                position = op["p"]
-                if "d" in op:
-                    deleted = op["d"]
-                    modified = modified[:position] + modified[position + len(deleted):]
-                elif "i" in op:
-                    modified = modified[:position] + op["i"] + modified[position:]
+            ops, modified = _compute_edit_operations(current, edits)
             if len(modified.encode("utf-8")) > MAX_FILE_SIZE:
                 raise FileSizeError(
                     f"Edited content exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit"

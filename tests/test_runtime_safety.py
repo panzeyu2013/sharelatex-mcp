@@ -141,6 +141,32 @@ def test_load_config_repairs_existing_permissions(
     assert stat.S_IMODE(config_file.stat().st_mode) == 0o600
 
 
+def test_load_config_accepts_symlinked_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "real-config.json"
+    target.write_text(
+        json.dumps(
+            {
+                "base_url": "https://overleaf.example",
+                "email": "user@example.com",
+                "password": "secret",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.json"
+    config_file.symlink_to(target)
+    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+
+    result = config_module.load_config()
+
+    assert result.base_url == "https://overleaf.example"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
 def test_download_file_accepts_filename_in_current_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -293,7 +319,7 @@ def test_compile_result_without_server_token_is_rejected() -> None:
         )
 
 
-def test_list_files_refreshes_remote_project_tree() -> None:
+def test_list_files_with_ids_uses_ttl_cache_then_force_refresh() -> None:
     project_id = "0123456789abcdef01234567"
 
     def make_tree(name: str, entity_id: str) -> dict:
@@ -330,9 +356,57 @@ def test_list_files_refreshes_remote_project_tree() -> None:
     first = client.list_files_with_ids(project_id)
     state["tree"] = make_tree("new.tex", "b" * 24)
     second = client.list_files_with_ids(project_id)
-
     assert [entity.path for entity in first] == ["/old.tex"]
-    assert [entity.path for entity in second] == ["/new.tex"]
+    assert [entity.path for entity in second] == ["/old.tex"]
+    assert state["calls"] == 1
+
+    third = client.list_files_with_ids(project_id, force_refresh=True)
+    assert [entity.path for entity in third] == ["/new.tex"]
+    assert state["calls"] == 2
+
+
+def test_resolve_entity_by_path_uses_fresh_cache_but_refreshes_on_miss() -> None:
+    project_id = "0123456789abcdef01234567"
+
+    def make_tree(name: str, entity_id: str) -> dict:
+        return {
+            "rootFolder": [
+                {
+                    "name": "rootFolder",
+                    "_id": "f" * 24,
+                    "docs": [{"name": name, "_id": entity_id}],
+                    "fileRefs": [],
+                    "folders": [],
+                }
+            ]
+        }
+
+    state = {
+        "tree": make_tree("a.tex", "a" * 24),
+        "calls": 0,
+    }
+
+    class FakeRealtime:
+        def join_project(self, _project_id):
+            state["calls"] += 1
+            return realtime_module.ProjectJoinData(
+                project=state["tree"],
+                permissions_level=None,
+                protocol_version=None,
+                public_id=None,
+            )
+
+    client = _make_project_client()
+    client.realtime_client = FakeRealtime()
+
+    first = client._resolve_entity_by_path(project_id, "/a.tex")
+    state["tree"] = make_tree("b.tex", "b" * 24)
+    second = client._resolve_entity_by_path(project_id, "/a.tex")
+    assert first.entity_id == second.entity_id == "a" * 24
+    assert state["calls"] == 1
+
+    third = client._resolve_entity_by_path(project_id, "/b.tex")
+    assert third.entity_id == "b" * 24
     assert state["calls"] == 2
 
 

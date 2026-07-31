@@ -319,8 +319,23 @@ def compute_edit_operations(current: str, edits: list[dict[str, str]]) -> list[d
 
     Raises ``EditMatchError`` if any ``old`` has zero or multiple matches.
     """
+    operations, _ = _compute_edit_operations(current, edits)
+    return operations
+
+
+def _compute_edit_operations(
+    current: str,
+    edits: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Like :func:`compute_edit_operations` but also returns the target content.
+
+    Returning the modified document alongside the operations lets callers check
+    the resulting size and recover from lost acks without re-applying the diff
+    a second time (the simulation would otherwise duplicate work already done
+    here at O(ops * len(doc))).
+    """
     if not edits:
-        return []
+        return [], current
 
     # Step 1: sort + initial uniqueness check on original current
     sorted_edits = sort_edits_by_position(edits, current, reverse=True)
@@ -346,7 +361,7 @@ def compute_edit_operations(current: str, edits: list[dict[str, str]]) -> list[d
         modified = modified[:first] + edit["new"] + modified[first + len(edit["old"]):]
 
     # Step 3: single diff → OT batch
-    return compute_diff_operations(current, modified)
+    return compute_diff_operations(current, modified), modified
 
 
 # ---------------------------------------------------------------------------

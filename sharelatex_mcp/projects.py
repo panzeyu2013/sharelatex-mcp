@@ -30,6 +30,11 @@ from sharelatex_mcp.validation import (
 
 logger = logging.getLogger(__name__)
 
+# Freshness window for the project tree / entity cache.  A short TTL keeps
+# listings correct enough for interactive use while avoiding a WebSocket
+# join_project handshake on every entity resolution.
+_TREE_CACHE_TTL_SECONDS = 10.0
+
 
 @dataclass
 class ProjectSummary:
@@ -138,7 +143,7 @@ class ProjectClient:
         self._compile_result_tokens_by_project: dict[str, str] = {}
         self._entity_cache: dict[str, dict[str, ProjectEntity]] = {}
         self._entity_id_index: dict[str, dict[str, str]] = {}
-        self._tree_cache: dict[str, dict[str, Any]] = {}
+        self._tree_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._trusted_download_origins = {
             self._url_origin(session_manager.config.base_url)
         }
@@ -149,6 +154,8 @@ class ProjectClient:
     def _invalidate_caches(self, project_id: str) -> None:
         self._compile_cache.pop(project_id, None)
         self._tree_cache.pop(project_id, None)
+        self._entity_cache.pop(project_id, None)
+        self._entity_id_index.pop(project_id, None)
 
     def _request_with_csrf_retry(
         self,
@@ -417,6 +424,14 @@ class ProjectClient:
                 del idx[entity.hash]
 
     def _resolve_entity_by_path(self, project_id: str, path: str) -> ProjectEntity:
+        # Serve from the entity cache while the tree it was derived from is
+        # still fresh.  A miss (including "not found") always forces a refresh,
+        # so recent uploads/renames are never hidden by a stale listing.
+        tree_entry = self._tree_cache.get(project_id)
+        if tree_entry is not None and (time.time() - tree_entry[0]) < _TREE_CACHE_TTL_SECONDS:
+            cached = self._get_cached_entity(project_id, path)
+            if cached is not None:
+                return cached
         entities = self.list_files_with_ids(project_id, force_refresh=True)
         target = next((entity for entity in entities if entity.path == path), None)
         if target is None:
@@ -544,15 +559,17 @@ class ProjectClient:
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         project_id = validate_project_id(project_id)
-        if not force_refresh and project_id in self._tree_cache:
-            return self._tree_cache[project_id]
+        if not force_refresh:
+            cached = self._tree_cache.get(project_id)
+            if cached is not None and (time.time() - cached[0]) < _TREE_CACHE_TTL_SECONDS:
+                return cached[1]
 
         attempts = 3
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
                 joined = self.realtime_client.join_project(project_id)
-                self._tree_cache[project_id] = joined.project
+                self._tree_cache[project_id] = (time.time(), joined.project)
                 return joined.project
             except (WebSocketConnectionClosedException, RuntimeError) as exc:
                 last_error = exc
@@ -1219,7 +1236,7 @@ class ProjectClient:
         self,
         project_id: str,
         *,
-        force_refresh: bool = True,
+        force_refresh: bool = False,
     ) -> list[ProjectEntity]:
         project_id = validate_project_id(project_id)
         project = self.get_project_tree(project_id, force_refresh=force_refresh)
