@@ -35,6 +35,10 @@ class OverleafSessionManager:
     def close(self) -> None:
         self.http.close()
 
+    def invalidate_login(self) -> None:
+        self._csrf_token = None
+        self.http.session.cookies.clear()
+
     def login(self) -> None:
         logger.info("Attempting login to %s", self.config.base_url)
         login_page = self.http.get("/login")
@@ -75,13 +79,10 @@ class OverleafSessionManager:
     def is_logged_in(self) -> bool:
         try:
             home = self.http.get("/project")
-        except (requests.ConnectionError, requests.Timeout):
+        except (requests.ConnectionError, requests.Timeout, RuntimeError):
             logger.debug("Network error checking login status", exc_info=True)
             return False
-        if home.status_code >= 500:
-            return False
-        location = home.headers.get("Location", "")
-        return not (300 <= home.status_code < 400 and "/login" in location)
+        return 200 <= home.status_code < 300
 
     def get_csrf_token(self, project_id: str | None = None, force_refresh: bool = False) -> str:
         if project_id is not None:
@@ -98,7 +99,7 @@ class OverleafSessionManager:
         path = f"/project/{project_id}" if project_id else "/project"
         logger.debug("Fetching CSRF token from %s", path)
         project_page = self.http.get(path)
-        if project_page.status_code >= 400:
+        if not 200 <= project_page.status_code < 300:
             raise RuntimeError(f"Failed to read CSRF page, status code: {project_page.status_code}")
         self._csrf_token = _extract_csrf(project_page.text)
         return self._csrf_token

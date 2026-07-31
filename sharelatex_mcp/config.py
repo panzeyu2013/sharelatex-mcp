@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,16 +58,30 @@ def _strip_json_comments(text: str) -> str:
 
 def _ensure_config_file() -> None:
     if not CONFIG_FILE.exists():
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(TEMPLATE, encoding="utf-8")
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return
+        with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+            config_file.write(TEMPLATE)
         raise SystemExit(
             f"Config file created at {CONFIG_FILE}. "
             "Please edit it with your credentials and restart the server."
         )
 
 
+def _secure_config_file_permissions() -> None:
+    if os.name != "posix":
+        return
+    if CONFIG_FILE.is_symlink():
+        raise RuntimeError(f"Config file must not be a symbolic link: {CONFIG_FILE}")
+    CONFIG_FILE.chmod(0o600)
+
+
 def load_config() -> AppConfig:
     _ensure_config_file()
+    _secure_config_file_permissions()
 
     raw = CONFIG_FILE.read_text(encoding="utf-8")
     clean = _strip_json_comments(raw)
@@ -78,21 +93,27 @@ def load_config() -> AppConfig:
     if not isinstance(data, dict):
         raise RuntimeError(f"Config file must contain a JSON object, got {type(data).__name__}")
 
-    base_url = data.get("base_url", "").rstrip("/")
+    raw_base_url = data.get("base_url", "")
+    if not isinstance(raw_base_url, str):
+        raise RuntimeError("base_url must be a string")
+    base_url = raw_base_url.rstrip("/")
     if not base_url:
         raise RuntimeError(f"Missing required field 'base_url' in {CONFIG_FILE}")
     if not (base_url.startswith("http://") or base_url.startswith("https://")):
         raise RuntimeError("base_url must start with http:// or https://")
 
     email = data.get("email", "")
-    if not email:
+    if not isinstance(email, str) or not email:
         raise RuntimeError(f"Missing required field 'email' in {CONFIG_FILE}")
 
     password = data.get("password", "")
-    if not password:
+    if not isinstance(password, str) or not password:
         raise RuntimeError(f"Missing required field 'password' in {CONFIG_FILE}")
 
-    if base_url.startswith("http://") and not data.get("allow_insecure_http", False):
+    allow_insecure_http = data.get("allow_insecure_http", False)
+    if not isinstance(allow_insecure_http, bool):
+        raise RuntimeError("allow_insecure_http must be a boolean")
+    if base_url.startswith("http://") and not allow_insecure_http:
         raise RuntimeError(
             "You are using an http:// URL. Set 'allow_insecure_http' to true in "
             f"{CONFIG_FILE} to proceed."
@@ -108,11 +129,14 @@ def load_config() -> AppConfig:
             project_id = validate_project_id(project_id)
 
     timeout_seconds = data.get("timeout_seconds", 15)
-    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 1:
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 1:
         raise RuntimeError("timeout_seconds must be a number >= 1")
     timeout_seconds = int(timeout_seconds)
 
-    log_level = data.get("log_level", "INFO").upper()
+    raw_log_level = data.get("log_level", "INFO")
+    if not isinstance(raw_log_level, str):
+        raise RuntimeError("log_level must be a string")
+    log_level = raw_log_level.upper()
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     if log_level not in valid_levels:
         raise RuntimeError(f"Invalid log_level: {log_level!r}. Must be one of {valid_levels}")
@@ -123,7 +147,7 @@ def load_config() -> AppConfig:
         email=email,
         password=password,
         timeout_seconds=timeout_seconds,
-        allow_insecure_http=bool(data.get("allow_insecure_http", False)),
+        allow_insecure_http=allow_insecure_http,
         project_id=project_id,
         log_level=typed_log_level,
     )

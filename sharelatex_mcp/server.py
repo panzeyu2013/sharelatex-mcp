@@ -302,7 +302,8 @@ def create_server() -> FastMCP:
         name="get_compile_logs",
         description=(
             "Read the output.log and .blg files from the most recent compilation. "
-            "Does not trigger a new compile by default; call compile_project first."
+            "Does not trigger a new compile by default; call compile_project first "
+            "and pass its result from the current server process."
         ),
     )
     def get_compile_logs(
@@ -323,7 +324,8 @@ def create_server() -> FastMCP:
         description=(
             "Analyze compile logs for structured diagnostics. "
             "Extracts LaTeX errors, citation/reference warnings, "
-            "BibTeX warnings, typesetting warnings, and fix suggestions."
+            "BibTeX warnings, typesetting warnings, and fix suggestions. "
+            "Any compile_result must come from the current server process."
         ),
     )
     def analyze_compile_errors(
@@ -343,7 +345,8 @@ def create_server() -> FastMCP:
         name="get_compile_artifacts",
         description=(
             "List artifacts from the most recent compilation, "
-            "including the resolved download URL for output.pdf when available."
+            "including the resolved download URL for output.pdf when available. "
+            "Any compile_result must come from the current server process."
         ),
     )
     def get_compile_artifacts(
@@ -361,7 +364,8 @@ def create_server() -> FastMCP:
         name="download_pdf",
         description=(
             "Download the output.pdf from the most recent compilation. "
-            "Pass compile_result to avoid triggering a new compile."
+            "Pass a compile_result from the current server process to avoid "
+            "triggering a new compile."
         ),
     )
     def download_pdf(

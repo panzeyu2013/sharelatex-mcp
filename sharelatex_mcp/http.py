@@ -88,7 +88,7 @@ class HttpClient:
     def get_absolute(self, absolute_url: str, **kwargs: Any) -> HttpResult:
         return self._request_text(
             "GET", absolute_url,
-            timeout=self.timeout_seconds, **kwargs,
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )
 
     def post_form(self, path: str, data: dict[str, str], **kwargs: Any) -> HttpResult:
@@ -130,5 +130,5 @@ class HttpClient:
     def get_bytes_absolute(self, absolute_url: str, **kwargs: Any) -> BinaryHttpResult:
         return self._request_bytes(
             "GET", absolute_url,
-            timeout=self.timeout_seconds, **kwargs,
+            timeout=self.timeout_seconds, allow_redirects=False, **kwargs,
         )

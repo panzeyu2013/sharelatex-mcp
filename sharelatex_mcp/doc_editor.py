@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from sharelatex_mcp.diff_engine import (
     MAX_EDITS_PER_CALL,
+    MAX_FILE_SIZE,
     MAX_NEW_LENGTH,
     MAX_OLD_LENGTH,
     check_edits_already_applied,
@@ -85,7 +86,6 @@ class DocEditor:
 
         # Size guard: enforce for full-file reads, warn for sliced reads
         byte_size = len(content.encode("utf-8"))
-        from sharelatex_mcp.diff_engine import MAX_FILE_SIZE
         if limit is None and byte_size > MAX_FILE_SIZE:
             raise FileSizeError(
                 f"File exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit. "
@@ -133,7 +133,6 @@ class DocEditor:
         project_id = validate_project_id(project_id)
 
         # Size check on input
-        from sharelatex_mcp.diff_engine import MAX_FILE_SIZE
         if len(content.encode("utf-8")) > MAX_FILE_SIZE:
             raise FileSizeError(
                 f"Content exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit"
@@ -220,9 +219,23 @@ class DocEditor:
             raise FileTypeError("edit is only supported for doc-type text files")
 
         doc_id = entity.entity_id or ""
+        expected_content: list[str | None] = [None]
 
         def _diff_fn(current: str) -> list[dict[str, Any]]:
             ops = compute_edit_operations(current, edits)
+            modified = current
+            for op in ops:
+                position = op["p"]
+                if "d" in op:
+                    deleted = op["d"]
+                    modified = modified[:position] + modified[position + len(deleted):]
+                elif "i" in op:
+                    modified = modified[:position] + op["i"] + modified[position:]
+            if len(modified.encode("utf-8")) > MAX_FILE_SIZE:
+                raise FileSizeError(
+                    f"Edited content exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit"
+                )
+            expected_content[0] = modified
             return convert_ot_positions_to_utf16(ops, current)
 
         try:
@@ -233,7 +246,7 @@ class DocEditor:
             except Exception:
                 raise ot_exc from None  # propagate original OT conflict if we can't verify
 
-            if check_edits_already_applied(content, edits):
+            if check_edits_already_applied(content, expected_content[0]):
                 logger.info("edit idempotent — changes already applied (lost ack recovered)")
                 self._client._invalidate_caches(project_id)
                 return {
@@ -310,11 +323,11 @@ class DocEditor:
                 raise ParamValidationError(f"edits[{i}] missing 'old' or 'new' field")
             if not isinstance(e["old"], str) or not isinstance(e["new"], str):
                 raise ParamValidationError(f"edits[{i}].old and .new must be strings")
-            if len(e["old"]) > MAX_OLD_LENGTH:
+            if len(e["old"].encode("utf-8")) > MAX_OLD_LENGTH:
                 raise ParamValidationError(
                     f"edits[{i}].old exceeds {MAX_OLD_LENGTH} bytes"
                 )
-            if len(e["new"]) > MAX_NEW_LENGTH:
+            if len(e["new"].encode("utf-8")) > MAX_NEW_LENGTH:
                 raise ParamValidationError(
                     f"edits[{i}].new exceeds {MAX_NEW_LENGTH} bytes"
                 )
@@ -358,7 +371,7 @@ class DocEditor:
             payload={"parent_folder_id": parent_folder_id, "name": name},
             extra_headers={"Accept": "application/json"},
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to create document, status code: {result.status_code}")
 
         try:
@@ -398,7 +411,7 @@ class DocEditor:
                     project_id=project_id,
                     path=f"/project/{project_id}/{mapped_type}/{entity_id}",
                 )
-                if delete_result.status_code >= 400:
+                if not 200 <= delete_result.status_code < 300:
                     raise RuntimeError(f"Delete returned status {delete_result.status_code}")
                 self._client._invalidate_caches(project_id)
                 logger.info("Rollback succeeded — deleted orphaned doc %s", doc_path)

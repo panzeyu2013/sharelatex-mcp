@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from sharelatex_mcp.diff_engine import compute_diff_operations
+from sharelatex_mcp.diff_engine import (
+    check_edits_already_applied,
+    compute_diff_operations,
+    compute_edit_operations,
+    convert_ot_positions_to_utf16,
+)
 
 
 def _apply_ops(text: str, ops: list[dict[str, Any]]) -> str:
@@ -20,6 +25,30 @@ def _apply_ops(text: str, ops: list[dict[str, Any]]) -> str:
             text = text[:p] + op["i"] + text[p:]
         else:
             raise ValueError(f"Malformed operation (missing 'd' or 'i'): {op!r}")
+    return text
+
+
+def _codepoint_offset_from_utf16(text: str, utf16_offset: int) -> int:
+    current_offset = 0
+    for index, char in enumerate(text):
+        if current_offset == utf16_offset:
+            return index
+        current_offset += 1 if ord(char) <= 0xFFFF else 2
+        if current_offset > utf16_offset:
+            raise AssertionError("OT position landed inside a UTF-16 surrogate pair")
+    assert current_offset == utf16_offset
+    return len(text)
+
+
+def _apply_utf16_ops(text: str, ops: list[dict[str, Any]]) -> str:
+    for op in ops:
+        position = _codepoint_offset_from_utf16(text, op["p"])
+        if "d" in op:
+            deleted = op["d"]
+            assert text[position:position + len(deleted)] == deleted
+            text = text[:position] + text[position + len(deleted):]
+        else:
+            text = text[:position] + op["i"] + text[position:]
     return text
 
 
@@ -135,3 +164,80 @@ def test_large_file_full_replacement_performance() -> None:
     new = "line " + "y" * 500_000
     ops = compute_diff_operations(old, new)
     assert _apply_ops(old, ops) == new
+
+
+@pytest.mark.timeout(5)
+def test_large_unicode_diff_uses_exact_sequential_utf16_positions() -> None:
+    old = "😀a" * 2_000
+    new_chars: list[str] = []
+    for index, char in enumerate(old):
+        if index < 1_200 and char == "a":
+            new_chars.extend(("X", char))
+        else:
+            new_chars.append(char)
+    new = "".join(new_chars)
+
+    operations = compute_diff_operations(old, new)
+    assert len(old) * len(operations) > 500_000
+
+    converted = convert_ot_positions_to_utf16(
+        [operation.copy() for operation in operations],
+        old,
+    )
+    assert _apply_utf16_ops(old, converted) == new
+
+
+def test_edit_preserves_decomposed_unicode_representation() -> None:
+    current = "cafe\u0301"
+    operations = compute_edit_operations(
+        current,
+        [{"old": current, "new": "coffee"}],
+    )
+    assert _apply_ops(current, operations) == "coffee"
+
+
+def test_lost_ack_recovery_requires_exact_expected_content() -> None:
+    expected = "hello new world"
+    assert check_edits_already_applied(expected, expected)
+    assert not check_edits_already_applied("hello world", expected)
+    assert not check_edits_already_applied("completely unrelated", expected)
+    assert not check_edits_already_applied(expected, None)
+
+
+def test_randomized_unicode_diff_roundtrips_after_utf16_conversion() -> None:
+    rng = random.Random(20260731)
+    alphabet = string.ascii_letters + "😀🚀世界"
+
+    for _ in range(100):
+        old = "".join(rng.choice(alphabet) for _ in range(rng.randint(20, 200)))
+        chars = list(old)
+        for _ in range(rng.randint(1, 10)):
+            position = rng.randint(0, len(chars))
+            if rng.choice((True, False)) and position < len(chars):
+                del chars[position:position + rng.randint(1, min(3, len(chars) - position))]
+            else:
+                chars[position:position] = [
+                    rng.choice(alphabet) for _ in range(rng.randint(1, 4))
+                ]
+        new = "".join(chars)
+        operations = compute_diff_operations(old, new)
+        converted = convert_ot_positions_to_utf16(
+            [operation.copy() for operation in operations],
+            old,
+        )
+        assert _apply_utf16_ops(old, converted) == new
+
+
+@pytest.mark.timeout(5)
+def test_maximum_size_sequential_ot_conversion_stays_bounded() -> None:
+    text_size = 2_000_000
+    operation_count = 2_000
+    step = text_size // operation_count
+    operations = [
+        {"p": index * step + index, "i": "X"}
+        for index in range(operation_count)
+    ]
+
+    converted = convert_ot_positions_to_utf16(operations, "a" * text_size)
+
+    assert len(converted) == operation_count

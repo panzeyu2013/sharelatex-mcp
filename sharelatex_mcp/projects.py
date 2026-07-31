@@ -4,9 +4,11 @@ import copy
 import html
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
+import secrets
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -132,9 +134,14 @@ class ProjectClient:
         self.session_manager = session_manager
         self.realtime_client = RealtimeProjectClient(session_manager.config, session_manager)
         self._compile_cache: dict[str, tuple[float, dict[str, object], tuple[object, ...]]] = {}
+        self._compile_results: dict[str, tuple[str, dict[str, object]]] = {}
+        self._compile_result_tokens_by_project: dict[str, str] = {}
         self._entity_cache: dict[str, dict[str, ProjectEntity]] = {}
         self._entity_id_index: dict[str, dict[str, str]] = {}
         self._tree_cache: dict[str, dict[str, Any]] = {}
+        self._trusted_download_origins = {
+            self._url_origin(session_manager.config.base_url)
+        }
 
     def close(self) -> None:
         self.session_manager.close()
@@ -151,7 +158,7 @@ class ProjectClient:
     ) -> HttpResult:
         project_id = validate_project_id(project_id)
         result: HttpResult | None = None
-        for force_refresh in (False, True):
+        for attempt, force_refresh in enumerate((False, True)):
             csrf_token = self.session_manager.get_csrf_token(
                 project_id=project_id, force_refresh=force_refresh,
             )
@@ -159,8 +166,10 @@ class ProjectClient:
             if extra_headers:
                 headers.update(extra_headers)
             result = request_fn(headers)
-            if result.status_code != 403:
+            if not self._is_auth_failure(result):
                 return result
+            if attempt == 0:
+                self.session_manager.invalidate_login()
         assert result is not None
         return result
 
@@ -191,7 +200,7 @@ class ProjectClient:
     ) -> HttpResult:
         project_id = validate_project_id(project_id)
         result: HttpResult | None = None
-        for force_refresh in (False, True):
+        for attempt, force_refresh in enumerate((False, True)):
             csrf_token = self.session_manager.get_csrf_token(
                 project_id=project_id, force_refresh=force_refresh,
             )
@@ -207,10 +216,19 @@ class ProjectClient:
                 headers=headers,
                 params=request_params,
             )
-            if result.status_code != 403:
+            if not self._is_auth_failure(result):
                 return result
+            if attempt == 0:
+                self.session_manager.invalidate_login()
         assert result is not None
         return result
+
+    @staticmethod
+    def _is_auth_failure(result: HttpResult) -> bool:
+        if result.status_code in {401, 403}:
+            return True
+        location = result.headers.get("Location", "")
+        return 300 <= result.status_code < 400 and "/login" in location
 
     def _delete_with_csrf(
         self,
@@ -281,6 +299,71 @@ class ProjectClient:
             "has_editor_id": "editorId" in payload,
         }
 
+    def _remember_compile_download_origins(self, payload: dict[str, object]) -> None:
+        download_domain = payload.get("pdfDownloadDomain")
+        if isinstance(download_domain, str) and download_domain.strip():
+            normalized = self._normalize_download_domain(
+                download_domain.strip(),
+                default_scheme=urlparse(self.session_manager.config.base_url).scheme,
+            )
+            self._trusted_download_origins.add(self._url_origin(normalized))
+
+        output_files = payload.get("outputFiles")
+        if not isinstance(output_files, list):
+            return
+        for item in output_files:
+            if not isinstance(item, dict):
+                continue
+            raw_url = item.get("url")
+            if isinstance(raw_url, str) and urlparse(raw_url).scheme:
+                self._trusted_download_origins.add(self._url_origin(raw_url))
+
+    def _store_compile_result(
+        self,
+        project_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        previous_token = self._compile_result_tokens_by_project.get(project_id)
+        if previous_token is not None:
+            self._compile_results.pop(previous_token, None)
+        token = secrets.token_urlsafe(24)
+        payload["result_token"] = token
+        self._compile_results[token] = (project_id, copy.deepcopy(payload))
+        self._compile_result_tokens_by_project[project_id] = token
+
+    def _validate_compile_result(
+        self,
+        project_id: str,
+        compile_result: dict[str, object],
+    ) -> dict[str, object]:
+        token = compile_result.get("result_token")
+        if not isinstance(token, str):
+            raise RuntimeError(
+                "compile_result must come from compile_project in the current server process"
+            )
+        stored = self._compile_results.get(token)
+        if stored is None or stored[0] != project_id:
+            raise RuntimeError(
+                "compile_result is unknown, expired, or belongs to a different project"
+            )
+        return copy.deepcopy(stored[1])
+
+    @staticmethod
+    def _url_origin(url: str) -> str:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            raise RuntimeError("Download URL must use http or https with a valid host")
+        if parsed.username is not None or parsed.password is not None:
+            raise RuntimeError("Download URL must not contain user credentials")
+
+        host = parsed.hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return f"{scheme}://{host}"
+
     def _map_entity_type(self, entity_type: str) -> str:
         return normalize_entity_type(entity_type)
 
@@ -334,10 +417,7 @@ class ProjectClient:
                 del idx[entity.hash]
 
     def _resolve_entity_by_path(self, project_id: str, path: str) -> ProjectEntity:
-        cached = self._get_cached_entity(project_id, path)
-        if cached is not None:
-            return cached
-        entities = self.list_files_with_ids(project_id)
+        entities = self.list_files_with_ids(project_id, force_refresh=True)
         target = next((entity for entity in entities if entity.path == path), None)
         if target is None:
             raise RuntimeError(f"Entity not found in project: {path}")
@@ -345,7 +425,11 @@ class ProjectClient:
 
     def _default_download_output_path(self, project_id: str, path: str) -> str:
         relative_path = path.lstrip("/")
-        return os.path.abspath(os.path.join("downloads", project_id, relative_path))
+        root = os.path.abspath(os.path.join("downloads", project_id))
+        output_path = os.path.abspath(os.path.join(root, relative_path))
+        if os.path.commonpath((root, output_path)) != root:
+            raise RuntimeError("Project path escapes the local downloads directory")
+        return output_path
 
     def list_projects(self) -> list[ProjectSummary]:
         self.session_manager.ensure_logged_in()
@@ -453,9 +537,14 @@ class ProjectClient:
             if isinstance(entity, dict) and "path" in entity and "type" in entity
         ]
 
-    def get_project_tree(self, project_id: str) -> dict[str, Any]:
+    def get_project_tree(
+        self,
+        project_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
         project_id = validate_project_id(project_id)
-        if project_id in self._tree_cache:
+        if not force_refresh and project_id in self._tree_cache:
             return self._tree_cache[project_id]
 
         attempts = 3
@@ -484,7 +573,7 @@ class ProjectClient:
 
     def get_root_doc(self, project_id: str) -> dict[str, str | None]:
         project_id = validate_project_id(project_id)
-        project = self.get_project_tree(project_id)
+        project = self.get_project_tree(project_id, force_refresh=True)
         root_doc_id = project.get("rootDoc_id")
         if not root_doc_id:
             return {
@@ -493,7 +582,7 @@ class ProjectClient:
                 "root_doc_path": None,
             }
 
-        entities = self.list_files_with_ids(project_id)
+        entities = self.list_files_with_ids(project_id, force_refresh=False)
         target = next((entity for entity in entities if entity.type == "doc" and entity.entity_id == root_doc_id), None)
         return {
             "project_id": project_id,
@@ -518,7 +607,7 @@ class ProjectClient:
             payload={"rootDocId": root_doc_id},
             extra_headers={"Accept": "application/json"},
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to set root doc, status code: {result.status_code}")
 
         self._invalidate_caches(project_id)
@@ -542,7 +631,7 @@ class ProjectClient:
         project_id = validate_project_id(project_id)
         if parent_folder_id is not None:
             parent_folder_id = validate_entity_id(parent_folder_id, "parent_folder_id")
-        project = self.get_project_tree(project_id)
+        project = self.get_project_tree(project_id, force_refresh=True)
         root_folders = project.get("rootFolder", [])
         if not root_folders:
             raise RuntimeError("Project missing rootFolder, unable to create folder")
@@ -564,7 +653,7 @@ class ProjectClient:
             },
             extra_headers={"Accept": "application/json"},
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to create folder, status code: {result.status_code}")
 
         try:
@@ -611,10 +700,31 @@ class ProjectClient:
         return_attempt_trace: bool = False,
     ) -> dict[str, object]:
         project_id = validate_project_id(project_id)
+        if isinstance(retry_on_500, bool) or not isinstance(retry_on_500, int):
+            raise RuntimeError("retry_on_500 must be an integer")
+        if not 0 <= retry_on_500 <= 3:
+            raise RuntimeError("retry_on_500 must be between 0 and 3")
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, (int, float))
+            or not math.isfinite(retry_delay_seconds)
+            or not 0 <= retry_delay_seconds <= 10
+        ):
+            raise RuntimeError("retry_delay_seconds must be between 0 and 10")
+        if (
+            isinstance(min_interval_seconds, bool)
+            or not isinstance(min_interval_seconds, (int, float))
+            or not math.isfinite(min_interval_seconds)
+            or not 0 <= min_interval_seconds <= 3600
+        ):
+            raise RuntimeError("min_interval_seconds must be between 0 and 3600")
+        if not isinstance(check, str) or not check or len(check) > 50:
+            raise RuntimeError("check must be a non-empty string up to 50 characters")
+
         if root_doc_id is not None:
             resolved_root_doc_id = validate_entity_id(root_doc_id, "root_doc_id")
         else:
-            project = self.get_project_tree(project_id)
+            project = self.get_project_tree(project_id, force_refresh=True)
             project_root_doc_id = project.get("rootDoc_id")
             if not isinstance(project_root_doc_id, str):
                 raise RuntimeError("Unable to determine rootDoc_id, cannot initiate compilation")
@@ -767,6 +877,8 @@ class ProjectClient:
         response_payload["selected_variant"] = selected_variant_label
         if return_attempt_trace:
             response_payload["attempt_trace"] = attempt_trace
+        self._remember_compile_download_origins(response_payload)
+        self._store_compile_result(project_id, response_payload)
         self._compile_cache[project_id] = (time.time(), copy.deepcopy(response_payload), params_key)
         return response_payload
 
@@ -821,6 +933,8 @@ class ProjectClient:
         trigger_compile_if_missing: bool = False,
     ) -> dict[str, object]:
         project_id = validate_project_id(project_id)
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1 <= max_bytes <= 2_000_000:
+            raise RuntimeError("max_bytes must be between 1 and 2000000")
         if compile_result is None:
             if not trigger_compile_if_missing:
                 return {
@@ -834,7 +948,7 @@ class ProjectClient:
                 }
             compile_payload = self.compile_project(project_id)
         else:
-            compile_payload = compile_result
+            compile_payload = self._validate_compile_result(project_id, compile_result)
         output_files_payload = compile_payload.get("outputFiles")
         output_files = output_files_payload if isinstance(output_files_payload, list) else []
         if not output_files:
@@ -976,7 +1090,7 @@ class ProjectClient:
                 }
             compile_payload = self.compile_project(project_id)
         else:
-            compile_payload = compile_result
+            compile_payload = self._validate_compile_result(project_id, compile_result)
         output_files_payload = compile_payload.get("outputFiles")
         output_files = output_files_payload if isinstance(output_files_payload, list) else []
         if not output_files:
@@ -1082,6 +1196,8 @@ class ProjectClient:
 
         if not output_path:
             output_path = os.path.abspath(f"downloads/{project_id}-output.pdf")
+        else:
+            output_path = os.path.abspath(output_path)
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as fh:
@@ -1099,9 +1215,14 @@ class ProjectClient:
             "resolved_url": resolved_url,
         }
 
-    def list_files_with_ids(self, project_id: str) -> list[ProjectEntity]:
+    def list_files_with_ids(
+        self,
+        project_id: str,
+        *,
+        force_refresh: bool = True,
+    ) -> list[ProjectEntity]:
         project_id = validate_project_id(project_id)
-        project = self.get_project_tree(project_id)
+        project = self.get_project_tree(project_id, force_refresh=force_refresh)
         root_folders = project.get("rootFolder", [])
         collected: list[ProjectEntity] = []
         for folder in root_folders:
@@ -1159,6 +1280,8 @@ class ProjectClient:
 
         if not output_path:
             output_path = self._default_download_output_path(project_id, path)
+        else:
+            output_path = os.path.abspath(output_path)
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as fh:
@@ -1368,7 +1491,7 @@ class ProjectClient:
             project_id=project_id,
             path=f"/project/{project_id}/{mapped_type}/{entity_id}",
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to delete entity, status code: {result.status_code}")
         self._cache_delete_by_entity_id(project_id, entity_id)
         self._invalidate_caches(project_id)
@@ -1396,7 +1519,7 @@ class ProjectClient:
             payload={"name": new_name},
             extra_headers={"Accept": "application/json"},
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to rename, status code: {result.status_code}")
 
         parent_path = target.path.rsplit("/", 1)[0]
@@ -1440,7 +1563,7 @@ class ProjectClient:
             payload={"folder_id": destination_folder_id},
             extra_headers={"Accept": "application/json"},
         )
-        if result.status_code >= 400:
+        if not 200 <= result.status_code < 300:
             raise RuntimeError(f"Failed to move entity, status code: {result.status_code}")
 
         entity_name = target.path.rsplit("/", 1)[-1]
@@ -1556,7 +1679,7 @@ class ProjectClient:
         project_id = validate_project_id(project_id)
         normalized = folder_path.strip() if folder_path else "/"
         if normalized in {"", "/"}:
-            project = self.get_project_tree(project_id)
+            project = self.get_project_tree(project_id, force_refresh=True)
             root_folders = project.get("rootFolder", [])
             if not root_folders or not isinstance(root_folders[0], dict) or not root_folders[0].get("_id"):
                 raise RuntimeError("Unable to determine rootFolder ID")
@@ -1600,6 +1723,11 @@ class ProjectClient:
             origin = base_origin
 
         resolved = raw_url if urlparse(raw_url).scheme else urljoin(origin.rstrip("/") + "/", raw_url.lstrip("/"))
+        resolved_origin = self._url_origin(resolved)
+        if resolved_origin not in self._trusted_download_origins:
+            raise RuntimeError(
+                f"Compile output URL origin is not trusted: {resolved_origin}"
+            )
 
         clsi_server_id = compile_payload.get("clsiServerId") or compile_payload.get("clsiserverid")
         if isinstance(clsi_server_id, str) and clsi_server_id:

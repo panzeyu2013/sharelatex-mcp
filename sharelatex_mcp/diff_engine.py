@@ -7,11 +7,11 @@ Designed for independent unit testing.
 from __future__ import annotations
 
 import logging
-import unicodedata
 from array import array
+from dataclasses import dataclass
 from typing import Any
 
-from diff_match_patch import diff_match_patch
+from diff_match_patch import diff_match_patch  # type: ignore[import-untyped]
 
 from sharelatex_mcp.errors import EditMatchError
 
@@ -129,6 +129,103 @@ def _likely_full_replace(old: str, new: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _TextSource:
+    text: str
+    utf16_offsets: array[int]
+
+    @classmethod
+    def from_text(cls, text: str) -> _TextSource:
+        offsets = array("I", [0])
+        offset = 0
+        for char in text:
+            offset += 1 if ord(char) <= 0xFFFF else 2
+            offsets.append(offset)
+        return cls(text=text, utf16_offsets=offsets)
+
+    def utf16_units(self, start: int, end: int) -> int:
+        return self.utf16_offsets[end] - self.utf16_offsets[start]
+
+
+@dataclass(frozen=True)
+class _TextPiece:
+    source: _TextSource
+    start: int
+    end: int
+
+    def __len__(self) -> int:
+        return self.end - self.start
+
+    @property
+    def utf16_units(self) -> int:
+        return self.source.utf16_units(self.start, self.end)
+
+
+class _Utf16TextState:
+    """Small piece table used to track exact sequential OT positions.
+
+    A diff produces at most ``MAX_DIFF_OPS`` operations, so scanning the
+    resulting few thousand pieces is substantially cheaper than rescanning a
+    multi-megabyte document for every operation while remaining exact.
+    """
+
+    def __init__(self, text: str) -> None:
+        source = _TextSource.from_text(text)
+        self._pieces = [_TextPiece(source, 0, len(text))] if text else []
+
+    def utf16_offset(self, position: int) -> int:
+        if position < 0:
+            raise ValueError("OT position must be >= 0")
+
+        remaining = position
+        offset = 0
+        for piece in self._pieces:
+            piece_length = len(piece)
+            if remaining <= piece_length:
+                return offset + piece.source.utf16_units(
+                    piece.start,
+                    piece.start + remaining,
+                )
+            remaining -= piece_length
+            offset += piece.utf16_units
+
+        # Preserve the previous defensive behaviour for malformed positions
+        # beyond the current document. Generated diffs should never need it.
+        return offset + remaining
+
+    def insert(self, position: int, text: str) -> None:
+        if not text:
+            return
+        index = self._split_at(position)
+        source = _TextSource.from_text(text)
+        self._pieces.insert(index, _TextPiece(source, 0, len(text)))
+
+    def delete(self, position: int, length: int) -> None:
+        if length <= 0:
+            return
+        start = self._split_at(position)
+        end = self._split_at(position + length)
+        del self._pieces[start:end]
+
+    def _split_at(self, position: int) -> int:
+        if position < 0:
+            raise ValueError("OT position must be >= 0")
+
+        remaining = position
+        for index, piece in enumerate(self._pieces):
+            piece_length = len(piece)
+            if remaining == 0:
+                return index
+            if remaining < piece_length:
+                split = piece.start + remaining
+                left = _TextPiece(piece.source, piece.start, split)
+                right = _TextPiece(piece.source, split, piece.end)
+                self._pieces[index:index + 1] = [left, right]
+                return index + 1
+            remaining -= piece_length
+        return len(self._pieces)
+
+
 def convert_ot_positions_to_utf16(operations: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
     """Convert all ``p`` fields from code-point to UTF-16 code-unit offsets.
 
@@ -137,76 +234,21 @@ def convert_ot_positions_to_utf16(operations: list[dict[str, Any]], text: str) -
     previous operations.  This function correctly handles sequential
     positions by simulating each operation's effect on the text.
 
-    For large diffs we degrade to an estimation-based path
-    (1 code-point ≈ 1 UTF-16 code-unit for positions beyond the
-    original text), which is exact for ASCII and a safe approximation
-    for the mixed case.
+    Uses an exact piece-table simulation so large diffs and inserted astral
+    characters cannot make later positions drift or land inside a surrogate
+    pair.
     """
     if not operations:
         return operations
 
-    # Pre-compute UTF-16 offset map for the original text
-    orig_offsets = array("I", [0]) * (len(text) + 1)
-    off = 0
-    for i, ch in enumerate(text):
-        off += 1 if ord(ch) <= 0xFFFF else 2
-        orig_offsets[i + 1] = off
-
-    # When the text-and-operations product is small, use the exact
-    # sequential-simulation path.  Otherwise fall back to the fast
-    # estimate path, which is still safe (it will never IndexError).
-    use_exact = (len(text) * len(operations)) <= 500_000
-
-    if use_exact:
-        return _convert_sequential_exact(operations, text)
-    else:
-        return _convert_estimate(operations, orig_offsets, text, off)
-
-
-def _convert_sequential_exact(operations: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
-    """Exact sequential-simulation path — correct for every input, O(n*m)."""
-    current_text = text
+    state = _Utf16TextState(text)
     for op in operations:
         p = op["p"]
-        limit = min(p, len(current_text))
-        utf16_p = 0
-        for i in range(limit):
-            utf16_p += 1 if ord(current_text[i]) <= 0xFFFF else 2
-        if p > len(current_text):
-            utf16_p += (p - len(current_text))
-        op["p"] = utf16_p
+        op["p"] = state.utf16_offset(p)
         if "d" in op:
-            current_text = current_text[:p] + current_text[p + len(op["d"]):]
+            state.delete(p, len(op["d"]))
         elif "i" in op:
-            current_text = current_text[:p] + op["i"] + current_text[p:]
-    return operations
-
-
-def _convert_estimate(
-    operations: list[dict[str, Any]],
-    orig_offsets: array[int],
-    text: str,
-    total_utf16: int,
-) -> list[dict[str, Any]]:
-    """Estimation path — expand lookup to max position, estimate beyond text."""
-    max_pos = len(text)
-    for op in operations:
-        if "p" in op and op["p"] > max_pos:
-            max_pos = op["p"]
-    if max_pos > len(text):
-        offsets = array("I", [0]) * (max_pos + 1)
-        for i in range(len(text) + 1):
-            offsets[i] = orig_offsets[i]
-        for pos in range(len(text) + 1, max_pos + 1):
-            offsets[pos] = total_utf16 + (pos - len(text))
-        for op in operations:
-            if "p" in op:
-                op["p"] = offsets[op["p"]]
-        return operations
-    # max_pos == len(text): reuse precomputed table
-    for op in operations:
-        if "p" in op:
-            op["p"] = orig_offsets[op["p"]]
+            state.insert(p, op["i"])
     return operations
 
 
@@ -269,8 +311,7 @@ def compute_edit_operations(current: str, edits: list[dict[str, str]]) -> list[d
 
     Algorithm (see design doc §5.2):
 
-    1. NFC-normalise only ``old`` / ``new`` — *current* stays raw so that
-       OT positions are relative to the same text that Overleaf stores.
+    1. Preserve the exact code-point representation supplied by the caller.
     2. Sort edits by original position (descending).
     3. Walk back-to-front through the list, applying each edit on the
        already-modified text and verifying uniqueness.
@@ -280,15 +321,6 @@ def compute_edit_operations(current: str, edits: list[dict[str, str]]) -> list[d
     """
     if not edits:
         return []
-
-    # Step 0: NFC-normalise old/new only — NOT current
-    normalized: list[dict[str, str]] = []
-    for e in edits:
-        normalized.append({
-            "old": unicodedata.normalize("NFC", e["old"]),
-            "new": unicodedata.normalize("NFC", e["new"]),
-        })
-    edits = normalized
 
     # Step 1: sort + initial uniqueness check on original current
     sorted_edits = sort_edits_by_position(edits, current, reverse=True)
@@ -322,34 +354,6 @@ def compute_edit_operations(current: str, edits: list[dict[str, str]]) -> list[d
 # ---------------------------------------------------------------------------
 
 
-def check_edits_already_applied(current: str, edits: list[dict[str, str]]) -> bool:
-    """Return ``True`` if *current* already reflects all *edits* being applied.
-
-    Used during OT retry when the ack was lost but the operation may have
-    succeeded (design doc §7.3).  Strategy: apply the edits naively to
-    *current* (without uniqueness validation — the edits have already been
-    applied, so ``old`` strings should be absent).  If the result is
-    identical to *current*, the edits were already present.  This avoids
-    false positives from ``new_text`` that coincidentally exists elsewhere.
-    """
-    if not edits:
-        return False
-
-    modified = current
-    any_change = False
-    for edit in edits:
-        old_text = unicodedata.normalize("NFC", edit["old"])
-        new_text = unicodedata.normalize("NFC", edit["new"])
-        if old_text == new_text:
-            continue
-
-        pos = modified.find(old_text)
-        if pos != -1:
-            # old_text still present → edits were NOT applied (or only partially)
-            return False
-        any_change = True
-
-    # If no old_text was found for any non-identity edit, and we found at
-    # least one non-identity edit, consider the edits already applied.
-    # If ALL edits were identity, return False (not "already applied").
-    return any_change
+def check_edits_already_applied(current: str, expected_content: str | None) -> bool:
+    """Return whether a lost-ack retry produced the exact submitted content."""
+    return expected_content is not None and current == expected_content
