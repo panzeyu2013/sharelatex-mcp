@@ -421,7 +421,13 @@ async def main() -> None:
             read_probe_snippet = dict(write_probe_read_payload)
             read_probe_snippet["content"] = write_probe_read_payload["content"][:400]
             print(json.dumps(read_probe_snippet, ensure_ascii=False, indent=2))
-            if write_probe_read_payload["content"] != write_probe_content:
+            # read() returns line-numbered content ("N: <line>"); strip the
+            # prefix so the comparison checks the actual document text.
+            write_probe_read_text = "\n".join(
+                line.split(": ", 1)[1] if ": " in line else line
+                for line in write_probe_read_payload["content"].split("\n")
+            )
+            if write_probe_read_text != write_probe_content:
                 raise RuntimeError("write 真实写入后回读内容不一致")
         finally:
             if os.path.exists(temp_upload_input.name):

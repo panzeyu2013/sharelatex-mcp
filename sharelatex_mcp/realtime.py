@@ -220,10 +220,22 @@ class RealtimeProjectClient:
     # Public API
     # ------------------------------------------------------------------
 
-    def join_project(self, project_id: str) -> ProjectJoinData:
+    def join_project(
+        self,
+        project_id: str,
+        timeout: float | None = None,
+    ) -> ProjectJoinData:
         logger.info("Joining project %s via realtime socket", project_id)
+        budget = timeout if timeout is not None else self._ack_budget()
+        deadline = time.monotonic() + budget
         with LegacySocketConnection(self.config, self.session_manager, project_id) as connection:
             for _ in range(_MAX_DRAIN_ITER):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if connection.ws is not None:
+                    with contextlib.suppress(Exception):
+                        connection.ws.settimeout(max(0.1, remaining))
                 message = connection.recv()
                 if not message.startswith("5:::"):
                     continue
@@ -254,25 +266,45 @@ class RealtimeProjectClient:
 
         raise WebSocketError("Failed to receive joinProjectResponse from websocket")
 
-    def join_doc_read(self, project_id: str, doc_id: str) -> str:
+    def join_doc_read(
+        self,
+        project_id: str,
+        doc_id: str,
+        timeout: float | None = None,
+    ) -> str:
         """Single-connection read: joinProject → joinDoc → snapshot → full text.
 
         Used by ``read()``.  Returns the raw document content as a single
         string (lines joined with ``\\n``).
 
+        *timeout* bounds the *entire* read (joinProject + joinDoc ack) in
+        seconds; when omitted it is derived from ``config.timeout_seconds``.
+        The two phases share the deadline so the total wait never exceeds it.
+
         Raises ``WebSocketError`` on any failure — caller should fall back
         to HTTP download.
         """
+        budget = timeout if timeout is not None else self._ack_budget()
+        deadline = time.monotonic() + budget
         logger.info("Reading doc %s via WebSocket joinDoc (project %s)", doc_id, project_id)
         with LegacySocketConnection(self.config, self.session_manager, project_id) as connection:
             connection.drain_initial_messages()
-            self._join_project(connection, project_id)
+            self._join_project(
+                connection,
+                project_id,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
             connection.send_event_with_ack(
                 ack_id=2,
                 event_name="joinDoc",
                 args=[doc_id, {"encodeRanges": True, "supportsHistoryOT": True}],
             )
-            doc_data = self._receive_join_doc_ack(connection, doc_id, ack_id=2)
+            doc_data = self._receive_join_doc_ack(
+                connection,
+                doc_id,
+                timeout=max(0.0, deadline - time.monotonic()),
+                ack_id=2,
+            )
         return _join_snapshot_lines(doc_data.snapshot_lines)
 
     def join_doc_write(
@@ -339,10 +371,11 @@ class RealtimeProjectClient:
     def _ack_budget(self) -> float:
         """Overall deadline for a single joinDoc/ack attempt.
 
-        Derived from ``config.timeout_seconds`` so raising the configured
-        timeout also extends the realtime-phase deadline on slow links.
+        Bounded by ``config.timeout_seconds`` (with a small floor) so a slow
+        or dead link fails fast instead of stalling the whole request well past
+        the configured timeout and tripping client request timeouts.
         """
-        return max(30.0, float(self.config.timeout_seconds))
+        return max(5.0, float(self.config.timeout_seconds))
 
     def _join_project(
         self,

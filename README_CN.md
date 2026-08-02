@@ -157,6 +157,14 @@ sharelatex-mcp
   "allow_insecure_http": false,
   // 供会修改真实项目的本地验证脚本使用的可选项目 ID
   "project_id": null,
+  // 登录态校验缓存秒数，避免每次操作探测 /project 触发限流（默认 30）
+  "session_check_ttl_seconds": 30,
+  // 项目文件树缓存秒数（默认 60）
+  "tree_cache_ttl_seconds": 60,
+  // 同项目操作锁获取超时秒数，卡住时快速失败（默认 30）
+  "lock_acquire_timeout_seconds": 30,
+  // 后台 write/edit 任务总预算秒数（默认 300）
+  "background_timeout_seconds": 300,
   // 日志级别：DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -173,6 +181,10 @@ sharelatex-mcp
 | `allow_insecure_http` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
 | `project_id` | 否 | 供会修改真实项目的本地验证脚本使用的 24 位项目 ID |
 | `async_write_threshold_bytes` | 否 | 内容超过该字节数时 `write`/`edit` 自动进入后台（`async_mode`）执行。默认 `262144` |
+| `session_check_ttl_seconds` | 否 | 登录态校验结果缓存秒数，避免每次操作都探测 `/project` 触发实例限流。默认 `30` |
+| `tree_cache_ttl_seconds` | 否 | 项目文件树缓存秒数，减少 WebSocket 树刷新。默认 `60` |
+| `lock_acquire_timeout_seconds` | 否 | 同项目操作锁获取超时秒数，卡住时快速失败而非无限等待。默认 `30` |
+| `background_timeout_seconds` | 否 | 后台 `write`/`edit` 任务总预算秒数（后台无客户端超时压力）。默认 `300` |
 | `log_level` | 否 | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO` |
 
 ### 4. 先做连通性验证
@@ -350,14 +362,27 @@ OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
   验证写入链路
 
-### 大内容写入报 `-32001` / `Request timed out`
+### 写入/读取报 `-32001` / `Request timed out`
 
-`-32001` 由 **MCP 客户端** 抛出，而不是本服务。对大型文档做整文件 `write`
-天然比针对性 `edit` 慢：服务端需要下载当前快照、计算 diff，再通过实时通道发送 OT 更新。
+`-32001` 由 **MCP 客户端** 在工具调用超时未返回时抛出。历史上根因是服务端
+实时层阻塞时间远超 `timeout_seconds`：每次操作都探测 `/project`（触发实例
+限流 429），且 WebSocket 预算有 30s 下限、多次重试不共享总 deadline。
 
-- 自 v0.1.0 起，服务端已做缓解：内容超过 `async_write_threshold_bytes`
-  （默认 256 KB）时 `write`/`edit` **自动转后台**，工具立即返回 `job_id`。
-- 在 OpenCode 中，`mcp.<名称>.timeout` 只影响“拉取工具列表”，**不会**影响
+当前服务端设计已消除这类超时：
+
+- `read` 走纯 HTTP（`/doc/{id}/download`），无状态且快。
+- 登录态校验缓存 `session_check_ttl_seconds` 秒，HTTP 429 视为"仍已登录"，
+  不再级联触发无谓重登录。
+- 每次 WebSocket 操作由 `timeout_seconds` 整体约束（重试共享同一 deadline），
+  失败快速报错而非挂起。
+- 同项目操作锁最多等待 `lock_acquire_timeout_seconds`。
+
+若仍遇到 `-32001`：
+
+- 确认运行的是当前版本：在项目根目录执行 `uv tool uninstall sharelatex-mcp
+  && uv tool install --reinstall .`（普通 `uv tool install` 可能复用缓存 wheel），
+  然后重启 MCP 会话。
+- 在 OpenCode 中，`mcp.<名称>.timeout` 只影响"拉取工具列表"，**不会**影响
   单次工具调用的超时。请检查你所用客户端的请求超时设置。
 - 实用缓解手段：
   - 增量修改优先用 `edit`（最小 diff），而不是 `write`
@@ -365,7 +390,7 @@ OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
   - 如果 Overleaf 主机或网络较慢，可调大 `~/.config/sharelatex-mcp/config.json`
     中的 `timeout_seconds`（默认 `60`）
   - 显式传 `async_mode=true`（或接受自动阈值），用 `get_job_status`/`wait_job` 获取结果
-- `read` 带 `offset`/`limit` 时仍会在切片前通过实时通道传输完整文档，并不会让大文件读取变便宜。
+- `read` 带 `offset`/`limit` 时仍会在切片前传输完整文档，并不会让大文件读取变便宜。
 
 ### 后台（异步）写入
 

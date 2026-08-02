@@ -41,12 +41,34 @@ def _per_project_lock(method: _F) -> _F:
     HTTP session / realtime channel never race on the same project.  Reentrant,
     so nested calls are safe.  Type-preserving: the wrapped callable keeps its
     original signature and return type for type checkers.
+
+    When the owner exposes ``_lock_acquire_timeout`` (seconds), the acquire is
+    timed so a stuck operation cannot block every later call on the project
+    indefinitely; it fails fast with a clear error instead.
     """
 
     @functools.wraps(method)
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         project_id = kwargs["project_id"] if "project_id" in kwargs else args[0]
-        with self._op_lock(project_id):
+        lock = self._op_lock(project_id)
+        timeout = getattr(self, "_lock_acquire_timeout", None)
+        if timeout is not None and hasattr(lock, "acquire"):
+            try:
+                acquired = lock.acquire(timeout=timeout)
+            except TypeError:  # fakes whose acquire() takes no timeout kwarg
+                lock.acquire()
+                acquired = True
+            if not acquired:
+                raise RuntimeError(
+                    f"Project {project_id} is busy: another operation has held the "
+                    f"per-project lock for longer than {timeout:.0f}s. Retry later."
+                )
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                lock.release()
+        # No timeout configured, or the lock is only a context manager (fakes).
+        with lock:
             return method(self, *args, **kwargs)
 
     return cast(_F, wrapper)
@@ -56,7 +78,8 @@ logger = logging.getLogger(__name__)
 
 # Freshness window for the project tree / entity cache.  A short TTL keeps
 # listings correct enough for interactive use while avoiding a WebSocket
-# join_project handshake on every entity resolution.
+# join_project handshake on every entity resolution.  The default is
+# overridable via ``config.tree_cache_ttl_seconds``.
 _TREE_CACHE_TTL_SECONDS = 10.0
 
 
@@ -162,6 +185,12 @@ class ProjectClient:
     def __init__(self, session_manager: OverleafSessionManager) -> None:
         self.session_manager = session_manager
         self.realtime_client = RealtimeProjectClient(session_manager.config, session_manager)
+        self._tree_cache_ttl = float(
+            getattr(session_manager.config, "tree_cache_ttl_seconds", _TREE_CACHE_TTL_SECONDS)
+        )
+        self._lock_acquire_timeout = getattr(
+            session_manager.config, "lock_acquire_timeout_seconds", None
+        )
         self._compile_cache: dict[str, tuple[float, dict[str, object], tuple[object, ...]]] = {}
         self._compile_results: dict[str, tuple[str, dict[str, object]]] = {}
         self._compile_result_tokens_by_project: dict[str, str] = {}
@@ -476,7 +505,7 @@ class ProjectClient:
         # still fresh.  A miss (including "not found") always forces a refresh,
         # so recent uploads/renames are never hidden by a stale listing.
         tree_entry = self._tree_cache.get(project_id)
-        if tree_entry is not None and (time.time() - tree_entry[0]) < _TREE_CACHE_TTL_SECONDS:
+        if tree_entry is not None and (time.time() - tree_entry[0]) < self._tree_cache_ttl:
             cached = self._get_cached_entity(project_id, path)
             if cached is not None:
                 return cached
@@ -609,14 +638,21 @@ class ProjectClient:
         project_id = validate_project_id(project_id)
         if not force_refresh:
             cached = self._tree_cache.get(project_id)
-            if cached is not None and (time.time() - cached[0]) < _TREE_CACHE_TTL_SECONDS:
+            if cached is not None and (time.time() - cached[0]) < self._tree_cache_ttl:
                 return cached[1]
 
+        # All retries share a single overall deadline so a slow/dead link
+        # fails fast instead of multiplying ``timeout_seconds`` per attempt.
         attempts = 3
+        budget = max(5.0, float(getattr(self.session_manager.config, "timeout_seconds", 30)))
+        deadline = time.monotonic() + budget
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                joined = self.realtime_client.join_project(project_id)
+                joined = self.realtime_client.join_project(
+                    project_id,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
                 self._tree_cache[project_id] = (time.time(), joined.project)
                 return joined.project
             except (WebSocketConnectionClosedException, RuntimeError) as exc:

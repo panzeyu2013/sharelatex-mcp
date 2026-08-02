@@ -170,6 +170,14 @@ This creates `~/.config/sharelatex-mcp/config.json` and exits. Edit it with your
   "allow_insecure_http": false,
   // Optional project id used by destructive local validation scripts
   "project_id": null,
+  // Login-status check cache (seconds) — avoids hammering /project (default: 30)
+  "session_check_ttl_seconds": 30,
+  // Project file-tree cache (seconds) (default: 60)
+  "tree_cache_ttl_seconds": 60,
+  // Per-project lock acquire timeout (seconds); fail fast instead of hanging (default: 30)
+  "lock_acquire_timeout_seconds": 30,
+  // Total budget for background write/edit jobs (default: 300)
+  "background_timeout_seconds": 300,
   // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -186,6 +194,10 @@ Configuration fields:
 | `allow_insecure_http` | No | Set `true` if you are using plain `http://` in a trusted local network |
 | `project_id` | No | Optional 24-character project id used by local validation scripts that modify a real project |
 | `async_write_threshold_bytes` | No | Content size in bytes above which `write`/`edit` automatically run in the background (`async_mode`). Default: `262144` |
+| `session_check_ttl_seconds` | No | Seconds to cache the login-status check so we don't probe `/project` on every operation and trip the instance rate limiter. Default: `30` |
+| `tree_cache_ttl_seconds` | No | Seconds to cache the project file tree between WebSocket refreshes. Default: `60` |
+| `lock_acquire_timeout_seconds` | No | Seconds a call waits for the per-project operation lock before failing fast instead of hanging behind a stuck operation. Default: `30` |
+| `background_timeout_seconds` | No | Total budget (seconds) for background `write`/`edit` jobs, which have no client request-timeout pressure. Default: `300` |
 | `log_level` | No | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. Default: `INFO` |
 
 ### 4. Smoke-test the connection
@@ -339,16 +351,30 @@ then this repository is built for that exact use case.
 - if your instance is heavily customized, validate write behavior with
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
 
-### `-32001` / `Request timed out` on large writes
+### `-32001` / `Request timed out` on writes and reads
 
-`-32001` is raised by the **MCP client**, not this server. A full `write` of a
-large document is inherently slower than a targeted `edit` because the server
-must download the current snapshot, compute a diff, and send the OT update over
-the realtime channel.
+`-32001` is raised by the **MCP client** when a tool call does not return in
+time. Historically this was caused by the server's realtime layer blocking for
+far longer than the configured `timeout_seconds`: the login-status check hit
+`/project` on every operation (tripping the instance rate limiter with HTTP
+429), and the WebSocket budget had a 30s floor with no shared deadline across
+retries.
 
-- Since v0.1.0 the server mitigates this: content above
-  `async_write_threshold_bytes` (default 256 KB) automatically runs **in the
-  background**, and the tool returns a `job_id` immediately.
+The current server design prevents this:
+
+- Reads go over plain HTTP (`/doc/{id}/download`) — stateless and fast.
+- The login-status check is cached for `session_check_ttl_seconds` and an HTTP
+  429 is treated as "still logged in", so the server never cascades into
+  spurious re-logins.
+- Every WebSocket operation is bounded by `timeout_seconds` (single shared
+  deadline across retries) and fails fast instead of hanging.
+- The per-project lock waits at most `lock_acquire_timeout_seconds`.
+
+If you still see `-32001`:
+
+- Verify you are running the current build: `uv tool uninstall sharelatex-mcp
+  && uv tool install --reinstall .` from the project root (a plain
+  `uv tool install` may reuse a cached wheel), then restart your MCP session.
 - In OpenCode the `mcp.<name>.timeout` option only affects *fetching the tool
   list*, not individual tool calls, so a longer timeout there does **not**
   fix tool-call timeouts. Check your client's request-timeout setting.
@@ -359,8 +385,8 @@ the realtime channel.
     `60`) if your Overleaf host or network is slow
   - pass `async_mode=true` explicitly (or accept the automatic threshold) and
     poll `get_job_status` / `wait_job` for the result
-- `read` with `offset`/`limit` still transfers the full document over the
-  realtime channel before slicing; it does not make large reads cheaper.
+- `read` with `offset`/`limit` still transfers the full document before
+  slicing; it does not make large reads cheaper.
 
 ### Background (async) writes
 

@@ -31,6 +31,18 @@ TEMPLATE = """\
   // Content size in bytes above which write/edit automatically run in the
   // background (async_mode) to avoid client request timeouts (default: 262144)
   "async_write_threshold_bytes": 262144,
+  // Seconds to cache the login-status check so we don't probe /project on
+  // every operation and trip the instance rate limiter (default: 30)
+  "session_check_ttl_seconds": 30,
+  // Seconds to cache the project file tree between WebSocket refreshes
+  // (default: 60)
+  "tree_cache_ttl_seconds": 60,
+  // Seconds a call will wait for the per-project operation lock before
+  // failing fast instead of hanging behind a stuck operation (default: 30)
+  "lock_acquire_timeout_seconds": 30,
+  // Total budget (seconds) for background write/edit jobs, which have no
+  // client request timeout pressure (default: 300)
+  "background_timeout_seconds": 300,
   // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -47,6 +59,10 @@ class AppConfig:
     project_id: str | None
     log_level: LogLevel
     async_write_threshold_bytes: int = 262144
+    session_check_ttl_seconds: int = 30
+    tree_cache_ttl_seconds: int = 60
+    lock_acquire_timeout_seconds: int = 30
+    background_timeout_seconds: int = 300
 
 
 def _strip_json_comments(text: str) -> str:
@@ -154,6 +170,46 @@ def load_config() -> AppConfig:
         raise RuntimeError("async_write_threshold_bytes must be a number >= 0")
     async_write_threshold_bytes = int(async_write_threshold_bytes)
 
+    session_check_ttl_seconds = data.get("session_check_ttl_seconds", 30)
+    if (
+        isinstance(session_check_ttl_seconds, bool)
+        or not isinstance(session_check_ttl_seconds, (int, float))
+        or not math.isfinite(session_check_ttl_seconds)
+        or session_check_ttl_seconds < 1
+    ):
+        raise RuntimeError("session_check_ttl_seconds must be a number >= 1")
+    session_check_ttl_seconds = int(session_check_ttl_seconds)
+
+    tree_cache_ttl_seconds = data.get("tree_cache_ttl_seconds", 60)
+    if (
+        isinstance(tree_cache_ttl_seconds, bool)
+        or not isinstance(tree_cache_ttl_seconds, (int, float))
+        or not math.isfinite(tree_cache_ttl_seconds)
+        or tree_cache_ttl_seconds < 1
+    ):
+        raise RuntimeError("tree_cache_ttl_seconds must be a number >= 1")
+    tree_cache_ttl_seconds = int(tree_cache_ttl_seconds)
+
+    lock_acquire_timeout_seconds = data.get("lock_acquire_timeout_seconds", 30)
+    if (
+        isinstance(lock_acquire_timeout_seconds, bool)
+        or not isinstance(lock_acquire_timeout_seconds, (int, float))
+        or not math.isfinite(lock_acquire_timeout_seconds)
+        or lock_acquire_timeout_seconds < 1
+    ):
+        raise RuntimeError("lock_acquire_timeout_seconds must be a number >= 1")
+    lock_acquire_timeout_seconds = int(lock_acquire_timeout_seconds)
+
+    background_timeout_seconds = data.get("background_timeout_seconds", 300)
+    if (
+        isinstance(background_timeout_seconds, bool)
+        or not isinstance(background_timeout_seconds, (int, float))
+        or not math.isfinite(background_timeout_seconds)
+        or background_timeout_seconds < 1
+    ):
+        raise RuntimeError("background_timeout_seconds must be a number >= 1")
+    background_timeout_seconds = int(background_timeout_seconds)
+
     raw_log_level = data.get("log_level", "INFO")
     if not isinstance(raw_log_level, str):
         raise RuntimeError("log_level must be a string")
@@ -171,5 +227,9 @@ def load_config() -> AppConfig:
         allow_insecure_http=allow_insecure_http,
         project_id=project_id,
         async_write_threshold_bytes=async_write_threshold_bytes,
+        session_check_ttl_seconds=session_check_ttl_seconds,
+        tree_cache_ttl_seconds=tree_cache_ttl_seconds,
+        lock_acquire_timeout_seconds=lock_acquire_timeout_seconds,
+        background_timeout_seconds=background_timeout_seconds,
         log_level=typed_log_level,
     )

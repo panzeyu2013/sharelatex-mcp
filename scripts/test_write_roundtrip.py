@@ -73,7 +73,13 @@ async def main() -> None:
         print("\nread:")
         print(json.dumps(read_payload, ensure_ascii=False, indent=2))
 
-        if read_payload["content"] != content:
+        # read() returns line-numbered content ("N: <line>"); strip the prefix
+        # so the round-trip comparison checks the actual document text.
+        read_text = "\n".join(
+            line.split(": ", 1)[1] if ": " in line else line
+            for line in read_payload["content"].split("\n")
+        )
+        if read_text != content:
             raise RuntimeError("写回后读取内容不一致")
     finally:
         entities = project_client.list_files_with_ids(project_id)

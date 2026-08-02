@@ -80,7 +80,7 @@ class DocEditor:
         """Read a doc-type file with optional line-range slicing.
 
         Returns a dict with ``content`` (line-numbered), ``total_lines``,
-        ``returned_lines``, ``source`` (``"websocket"`` or ``"http_fallback"``).
+        ``returned_lines``, ``source`` (``"http"`` or ``"websocket"``).
         """
         project_id = validate_project_id(project_id)
         if offset < 0:
@@ -153,11 +153,13 @@ class DocEditor:
         path: str,
         content: str,
         progress: ProgressCallback | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Write content to a doc.  Auto-creates the file if it does not exist.
 
         *progress* is an optional ``(done, total, message)`` callback forwarded
-        to the realtime pipeline.
+        to the realtime pipeline.  *timeout* bounds the realtime write phase in
+        seconds; when omitted it is derived from ``config.timeout_seconds``.
 
         Returns ``{"project_id", "path", "changed", "created", "message"}``.
         """
@@ -182,7 +184,7 @@ class DocEditor:
             entity = None
 
         if entity is None:
-            return self._create_doc_and_insert(project_id, path, content)
+            return self._create_doc_and_insert(project_id, path, content, timeout=timeout)
 
         if entity.type != "doc":
             raise FileTypeError("write is only supported for doc-type text files")
@@ -202,6 +204,7 @@ class DocEditor:
             self._realtime.join_doc_write(
                 project_id, entity.entity_id or "",
                 _diff_fn,
+                timeout=timeout,
                 progress=progress,
             )
         except OTTransportError:
@@ -219,6 +222,7 @@ class DocEditor:
                     "path": path,
                     "changed": True,
                     "created": False,
+                    "entity_id": entity.entity_id,
                     "message": "Write already applied (ack recovery)",
                 }
             raise
@@ -231,6 +235,7 @@ class DocEditor:
             "path": path,
             "changed": changed,
             "created": False,
+            "entity_id": entity.entity_id,
             "message": "File content unchanged, skipped write" if not changed else "Write operation sent",
         }
 
@@ -245,6 +250,7 @@ class DocEditor:
         path: str,
         edits: list[dict[str, str]],
         progress: ProgressCallback | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Apply a batch of find-and-replace edits atomically.
 
@@ -252,7 +258,8 @@ class DocEditor:
         exactly one location after prior edits are applied.
 
         *progress* is an optional ``(done, total, message)`` callback forwarded
-        to the realtime pipeline.
+        to the realtime pipeline.  *timeout* bounds the realtime write phase in
+        seconds; when omitted it is derived from ``config.timeout_seconds``.
         """
         project_id = validate_project_id(project_id)
         self._validate_edits(edits)
@@ -287,7 +294,7 @@ class DocEditor:
             return convert_ot_positions_to_utf16(ops, current)
 
         try:
-            self._realtime.join_doc_write(project_id, doc_id, _diff_fn, progress=progress)
+            self._realtime.join_doc_write(project_id, doc_id, _diff_fn, timeout=timeout, progress=progress)
         except (OTConflictError, EditMatchError, OTTransportError) as ot_exc:
             try:
                 content, _ = self._fetch_content(project_id, entity)
@@ -329,34 +336,35 @@ class DocEditor:
     def _fetch_content(self, project_id: str, entity) -> tuple[str, str]:
         """Fetch document content. Returns (text, source).
 
-        Primary path: WebSocket joinDoc.  Falls back to HTTP download.
+        Primary path: HTTP download (stateless, fast, reliable).  Falls back
+        to the WebSocket joinDoc snapshot.
         """
         doc_id = entity.entity_id
         if not doc_id:
             raise FileReadError("Entity has no document ID")
 
-        # Primary: WebSocket
-        try:
-            content = self._realtime.join_doc_read(project_id, doc_id)
-            return content, "websocket"
-        except WebSocketError:
-            logger.warning("WebSocket read failed for %s, falling back to HTTP", entity.path)
-
-        # Fallback: HTTP
+        # Primary: HTTP
         try:
             result = self._client.session_manager.http.get(
                 f"/project/{project_id}/doc/{doc_id}/download"
             )
             if result.status_code != 200:
                 raise FileReadError(f"HTTP download failed, status {result.status_code}")
-            # Normalize CRLF to LF so the fallback text matches the WebSocket
+            # Normalize CRLF to LF so the HTTP text matches the WebSocket
             # snapshot representation (see realtime._join_snapshot_lines).
             normalized = "\n".join(
                 line.rstrip("\r") for line in result.text.split("\n")
             )
-            return normalized, "http_fallback"
+            return normalized, "http"
         except Exception:
-            raise FileReadError("Both WebSocket and HTTP reads are unavailable") from None
+            logger.warning("HTTP read failed for %s, falling back to WebSocket", entity.path)
+
+        # Fallback: WebSocket
+        try:
+            content = self._realtime.join_doc_read(project_id, doc_id)
+            return content, "websocket"
+        except WebSocketError:
+            raise FileReadError("Both HTTP and WebSocket reads are unavailable") from None
 
     def _is_binary_path(self, path: str) -> bool:
         """Check if path has a known binary extension."""
@@ -390,7 +398,7 @@ class DocEditor:
                 )
 
     def _create_doc_and_insert(
-        self, project_id: str, path: str, content: str
+        self, project_id: str, path: str, content: str, timeout: float | None = None,
     ) -> dict[str, Any]:
         """Create a new doc and write *content* into it.
 
@@ -453,7 +461,7 @@ class DocEditor:
                 ops = compute_diff_operations(current, content)
                 return convert_ot_positions_to_utf16(ops, current)
 
-            self._realtime.join_doc_write(project_id, entity_id, _diff_fn)
+            self._realtime.join_doc_write(project_id, entity_id, _diff_fn, timeout=timeout)
         except Exception as write_exc:
             logger.error(
                 "WebSocket write failed after creating doc %s, attempting rollback", doc_path
@@ -498,5 +506,6 @@ class DocEditor:
             "path": doc_path,
             "changed": True,
             "created": True,
+            "entity_id": entity_id,
             "message": "Document created and content written",
         }

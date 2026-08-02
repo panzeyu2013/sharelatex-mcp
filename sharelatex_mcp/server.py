@@ -54,13 +54,20 @@ def create_server(
         Called from ``anyio.to_thread.run_sync`` worker threads, which are
         anyio-managed, so ``anyio.from_thread.run`` can schedule the async
         ``report_progress`` onto the server loop without a cross-thread token.
+        The forwarded call is bounded by ``anyio.fail_after`` so a stalled
+        progress notification can never deadlock the worker thread — it degrades
+        to silent progress instead of hanging the operation.
         """
         warned = False
+
+        async def _safe_report(done: int, total: int, message: str | None) -> None:
+            with anyio.fail_after(2.0):
+                await ctx.report_progress(done, total, message)
 
         def report(done: int, total: int, message: str | None) -> None:
             nonlocal warned
             try:
-                anyio.from_thread.run(ctx.report_progress, done, total, message)
+                anyio.from_thread.run(_safe_report, done, total, message)
             except Exception:
                 if not warned:
                     warned = True
@@ -256,14 +263,32 @@ def create_server(
         if async_mode is None:
             async_mode = content_bytes > config.async_write_threshold_bytes
         if async_mode:
+            # Background jobs have no client request timeout, so they get a
+            # generous budget instead of the foreground sync budget.
             return _submit_job(
-                "write", project_id, lambda: doc_editor.write(project_id, path, content)
+                "write",
+                project_id,
+                lambda: doc_editor.write(
+                    project_id, path, content, timeout=config.background_timeout_seconds
+                ),
             )
         if ctx is None:
-            return await anyio.to_thread.run_sync(doc_editor.write, project_id, path, content)
+            return await anyio.to_thread.run_sync(
+                doc_editor.write,
+                project_id,
+                path,
+                content,
+                None,
+                config.timeout_seconds,
+            )
         progress = _wire_progress(ctx)
         return await anyio.to_thread.run_sync(
-            doc_editor.write, project_id, path, content, progress
+            doc_editor.write,
+            project_id,
+            path,
+            content,
+            progress,
+            config.timeout_seconds,
         )
 
     @mcp.tool(
@@ -297,13 +322,29 @@ def create_server(
             async_mode = edit_bytes > config.async_write_threshold_bytes
         if async_mode:
             return _submit_job(
-                "edit", project_id, lambda: doc_editor.edit(project_id, path, edits)
+                "edit",
+                project_id,
+                lambda: doc_editor.edit(
+                    project_id, path, edits, timeout=config.background_timeout_seconds
+                ),
             )
         if ctx is None:
-            return await anyio.to_thread.run_sync(doc_editor.edit, project_id, path, edits)
+            return await anyio.to_thread.run_sync(
+                doc_editor.edit,
+                project_id,
+                path,
+                edits,
+                None,
+                config.timeout_seconds,
+            )
         progress = _wire_progress(ctx)
         return await anyio.to_thread.run_sync(
-            doc_editor.edit, project_id, path, edits, progress
+            doc_editor.edit,
+            project_id,
+            path,
+            edits,
+            progress,
+            config.timeout_seconds,
         )
 
     @mcp.tool(
