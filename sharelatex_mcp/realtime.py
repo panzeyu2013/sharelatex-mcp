@@ -60,13 +60,24 @@ _OT_BASE_DELAY = 0.1   # 100 ms
 
 
 def _join_snapshot_lines(snapshot_lines: Iterable[str]) -> str:
-    """Join Overleaf snapshot lines into doc text, normalizing CRLF to LF.
+    """Join Overleaf snapshot lines into doc text, normalizing encoding/CRLF.
 
-    Stripping a trailing ``\\r`` per line makes the text identical across the
-    WebSocket snapshot and the HTTP-fallback read, so ``read``/``write``/``edit``
-    all operate on the same representation.
+    The legacy realtime server transmits each document line as a Latin-1
+    decoding of its UTF-8 bytes (one byte per code unit).  We convert it back to
+    proper Unicode so ``read``/``write``/``edit`` operate on real text; a line
+    that is already genuine Unicode is left untouched (the conversion raises and
+    is skipped).  Also strips a trailing ``\\r`` per line so CRLF docs match the
+    HTTP-fallback representation.
     """
-    return "\n".join(line.rstrip("\r") for line in snapshot_lines)
+    out: list[str] = []
+    for line in snapshot_lines:
+        if not isinstance(line, str):
+            line = str(line)
+        if any(ord(ch) > 0x7F for ch in line):
+            with contextlib.suppress(UnicodeEncodeError, UnicodeDecodeError):
+                line = line.encode("latin-1").decode("utf-8")
+        out.append(line.rstrip("\r"))
+    return "\n".join(out)
 
 
 class LegacySocketConnection:
@@ -244,7 +255,7 @@ class RealtimeProjectClient:
         raise WebSocketError("Failed to receive joinProjectResponse from websocket")
 
     def join_doc_read(self, project_id: str, doc_id: str) -> str:
-        """Single-connection read: joinDoc → snapshot_lines → return full text.
+        """Single-connection read: joinProject → joinDoc → snapshot → full text.
 
         Used by ``read()``.  Returns the raw document content as a single
         string (lines joined with ``\\n``).
@@ -255,12 +266,13 @@ class RealtimeProjectClient:
         logger.info("Reading doc %s via WebSocket joinDoc (project %s)", doc_id, project_id)
         with LegacySocketConnection(self.config, self.session_manager, project_id) as connection:
             connection.drain_initial_messages()
+            self._join_project(connection, project_id)
             connection.send_event_with_ack(
-                ack_id=1,
+                ack_id=2,
                 event_name="joinDoc",
                 args=[doc_id, {"encodeRanges": True, "supportsHistoryOT": True}],
             )
-            doc_data = self._receive_join_doc_ack(connection, doc_id)
+            doc_data = self._receive_join_doc_ack(connection, doc_id, ack_id=2)
         return _join_snapshot_lines(doc_data.snapshot_lines)
 
     def join_doc_write(
@@ -332,6 +344,47 @@ class RealtimeProjectClient:
         """
         return max(30.0, float(self.config.timeout_seconds))
 
+    def _join_project(
+        self,
+        connection: LegacySocketConnection,
+        project_id: str,
+        timeout: float | None = None,
+    ) -> None:
+        """Associate the socket with the project before joinDoc.
+
+        The realtime server rejects ``joinDoc`` with "no project_id found on
+        client" unless the socket has completed a ``joinProject`` round-trip
+        first.  *timeout* bounds the wait; when omitted it is derived from
+        ``config.timeout_seconds``.
+        """
+        timeout = timeout if timeout is not None else self._ack_budget()
+        connection.send_event_with_ack(1, "joinProject", [project_id])
+        deadline = time.monotonic() + timeout
+        wait_granularity = max(
+            self.config.timeout_seconds, _HEARTBEAT_INTERVAL_SECONDS + 5
+        )
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if connection.ws is not None:
+                with contextlib.suppress(Exception):
+                    connection.ws.settimeout(min(remaining, wait_granularity))
+            try:
+                message = connection.recv()
+            except WebSocketTimeoutError:
+                continue
+            if not message.startswith("5:::"):
+                continue
+            try:
+                payload = json.loads(message[4:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("name") == "joinProjectResponse":
+                logger.debug("Joined project %s on realtime socket", project_id)
+                return
+        raise WebSocketError("Failed to receive joinProjectResponse")
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -353,8 +406,13 @@ class RealtimeProjectClient:
         with LegacySocketConnection(self.config, self.session_manager, project_id) as connection:
             try:
                 connection.drain_initial_messages()
+                self._join_project(
+                    connection,
+                    project_id,
+                    timeout=max(0.0, attempt_deadline - time.monotonic()),
+                )
                 connection.send_event_with_ack(
-                    ack_id=1,
+                    ack_id=2,
                     event_name="joinDoc",
                     args=[doc_id, {"encodeRanges": True, "supportsHistoryOT": True}],
                 )
@@ -362,6 +420,7 @@ class RealtimeProjectClient:
                     connection,
                     doc_id,
                     timeout=max(0.0, attempt_deadline - time.monotonic()),
+                    ack_id=2,
                 )
                 current = _join_snapshot_lines(doc_data.snapshot_lines)
                 if progress is not None:
@@ -417,7 +476,7 @@ class RealtimeProjectClient:
                     doc_id, len(operations), payload_chars / 1024,
                 )
                 connection.send_event_with_ack(
-                    ack_id=2,
+                    ack_id=3,
                     event_name="applyOtUpdate",
                     args=[
                         doc_id,
@@ -433,7 +492,7 @@ class RealtimeProjectClient:
 
                 self._wait_for_ack(
                     connection,
-                    ack_id=2,
+                    ack_id=3,
                     doc_id=doc_id,
                     timeout=max(0.0, attempt_deadline - time.monotonic()),
                 )
@@ -447,8 +506,9 @@ class RealtimeProjectClient:
         connection: LegacySocketConnection,
         doc_id: str,
         timeout: float | None = None,
+        ack_id: int = 1,
     ) -> DocJoinData:
-        """Wait for and parse the joinDoc ack response (``6:::1+[...]``).
+        """Wait for and parse the joinDoc ack response (``6:::<ack_id>+[...]``).
 
         Uses a recv timeout at least as long as the socket.io heartbeat
         interval so ``recv()`` can answer server heartbeats inline while a
@@ -458,6 +518,7 @@ class RealtimeProjectClient:
         ``config.timeout_seconds``.
         """
         timeout = timeout if timeout is not None else self._ack_budget()
+        ack_prefix = f"6:::{ack_id}+"
         wait_granularity = max(
             self.config.timeout_seconds, _HEARTBEAT_INTERVAL_SECONDS + 5
         )
@@ -470,7 +531,7 @@ class RealtimeProjectClient:
                 with contextlib.suppress(Exception):
                     connection.ws.settimeout(min(remaining, wait_granularity))
             message = connection.recv()
-            if not message.startswith("6:::1+"):
+            if not message.startswith(ack_prefix):
                 continue
 
             try:
@@ -514,7 +575,7 @@ class RealtimeProjectClient:
         broadcasts as acks, causing premature returns under concurrent
         editing.
         """
-        ack_prefix = f"6:::{ack_id}+"
+        ack_prefix = f"6:::{ack_id}"
         deadline = time.monotonic() + timeout
         # Wait long enough per recv() to catch socket.io heartbeats so the
         # inline reply in recv() keeps the connection alive while we wait.
@@ -554,24 +615,39 @@ class RealtimeProjectClient:
 
                 event_name = parsed.get("name")
                 if event_name == "otUpdateError":
+                    # The args may be ["message", {project_id, doc_id, ...}] or
+                    # [{doc: <id>, ...}]; find the doc id wherever it lives.
                     args = parsed.get("args", [])
-                    if isinstance(args, list) and args and isinstance(args[0], dict) and args[0].get("doc") == doc_id:
+                    doc_matches = False
+                    if isinstance(args, list):
+                        for item in args:
+                            if isinstance(item, dict) and item.get("doc") == doc_id:
+                                doc_matches = True
+                                break
+                    if doc_matches:
                         raise OTConflictError(f"applyOtUpdate error from server: {parsed}")
                 # Ignore otUpdateApplied broadcasts — they are not our ack
                 continue
 
             if message.startswith(ack_prefix):
-                try:
-                    payload = json.loads(message.split("+", 1)[1])
-                except json.JSONDecodeError:
-                    logger.warning("Unparseable applyOtUpdate ack response")
-                    continue
-                if not isinstance(payload, list):
-                    raise OTTransportError(
-                        f"Unexpected applyOtUpdate ack payload for doc {doc_id}: {payload!r}"
-                    )
-                if payload and payload[0] is not None:
-                    raise OTConflictError(f"applyOtUpdate returned error: {payload[0]}")
+                # applyOtUpdate acks are bare ("6:::3", no payload) on success;
+                # a payload is only present for error acks. Guard against a
+                # longer id sharing the prefix (e.g. "6:::30").
+                remainder = message[len(ack_prefix):]
+                if remainder.startswith("+"):
+                    try:
+                        payload = json.loads(remainder[1:])
+                    except json.JSONDecodeError:
+                        logger.warning("Unparseable applyOtUpdate ack response")
+                        continue
+                    if not isinstance(payload, list):
+                        raise OTTransportError(
+                            f"Unexpected applyOtUpdate ack payload for doc {doc_id}: {payload!r}"
+                        )
+                    if payload and payload[0] is not None:
+                        raise OTConflictError(f"applyOtUpdate returned error: {payload[0]}")
+                elif remainder != "":
+                    continue  # a different message that merely shares the prefix
                 logger.debug("OT update acknowledged for doc %s (ack_id=%d)", doc_id, ack_id)
                 return
 

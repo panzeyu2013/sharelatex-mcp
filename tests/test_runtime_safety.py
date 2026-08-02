@@ -587,12 +587,12 @@ def test_compile_cache_key_includes_root_doc_id(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_join_doc_write_applies_ot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """join_doc_write must correctly drain, joinDoc, diff, and apply OT."""
+    """join_doc_write must correctly drain, joinProject, joinDoc, diff, and apply OT."""
     messages = [
         "1::",
-        "1::",
-        "6:::1+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
-        "6:::2+[]",
+        '5:::{"name":"joinProjectResponse","args":[null]}',
+        "6:::2+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
+        "6:::3",
     ]
 
     class FakeConnection:
@@ -613,7 +613,7 @@ def test_join_doc_write_applies_ot(monkeypatch: pytest.MonkeyPatch) -> None:
         def send_event_with_ack(self, ack_id: int, event_name: str, args: list) -> None:
             self.sent.append((ack_id, event_name, args))
 
-        def drain_initial_messages(self, expected_count: int = 2) -> None:
+        def drain_initial_messages(self, expected_count: int = 1) -> None:
             for _ in range(expected_count):
                 self.recv()
 
@@ -778,7 +778,7 @@ def test_wait_for_ack_fails_fast_when_connection_closes(monkeypatch: pytest.Monk
         def _send_locked(self, _data: str) -> None:
             return None
 
-        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
             for _ in range(_expected_count):
                 self.recv()
 
@@ -790,7 +790,9 @@ def test_wait_for_ack_fails_fast_when_connection_closes(monkeypatch: pytest.Monk
             if self.calls <= 2:
                 return "1::"
             if self.calls == 3:
-                return "6:::1+" + json.dumps(
+                return '5:::{"name":"joinProjectResponse","args":[null]}'
+            if self.calls == 4:
+                return "6:::2+" + json.dumps(
                     [None, ["hello world"], 7, [], {}, "sharejs-text-ot"]
                 )
             raise realtime_module.WebSocketError("connection closed")
@@ -817,9 +819,9 @@ def test_wait_for_ack_uses_heartbeat_aware_recv_timeout(
     seen_timeouts: list[float] = []
     messages = [
         "1::",
-        "1::",
-        "6:::1+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
-        "6:::2+[]",
+        '5:::{"name":"joinProjectResponse","args":[null]}',
+        "6:::2+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
+        "6:::3",
     ]
 
     class FakeConnection:
@@ -839,7 +841,7 @@ def test_wait_for_ack_uses_heartbeat_aware_recv_timeout(
         def _send_locked(self, _data: str) -> None:
             return None
 
-        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
             for _ in range(_expected_count):
                 self.recv()
 
@@ -940,9 +942,9 @@ def test_doc_editor_read_acquires_per_project_lock() -> None:
 def test_join_doc_write_reports_progress_stages(monkeypatch: pytest.MonkeyPatch) -> None:
     messages = [
         "1::",
-        "1::",
-        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
-        "6:::2+[]",
+        '5:::{"name":"joinProjectResponse","args":[null]}',
+        "6:::2+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+        "6:::3",
     ]
 
     class FakeConnection:
@@ -962,7 +964,7 @@ def test_join_doc_write_reports_progress_stages(monkeypatch: pytest.MonkeyPatch)
         def _send_locked(self, _data: str) -> None:
             return None
 
-        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
             for _ in range(_expected_count):
                 self.recv()
 
@@ -991,8 +993,8 @@ def test_join_doc_write_reports_progress_stages(monkeypatch: pytest.MonkeyPatch)
 def test_ot_update_error_is_reported_as_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
     messages = [
         "1::",
-        "1::",
-        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+        '5:::{"name":"joinProjectResponse","args":[null]}',
+        "6:::2+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
         "5:::" + json.dumps({"name": "otUpdateError", "args": [{"doc": "a" * 24}]}),
     ]
 
@@ -1014,7 +1016,7 @@ def test_ot_update_error_is_reported_as_conflict(monkeypatch: pytest.MonkeyPatch
         def _send_locked(self, _data: str) -> None:
             return None
 
-        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
             for _ in range(_expected_count):
                 self.recv()
 
@@ -1067,10 +1069,10 @@ def test_join_doc_write_bounds_total_time_by_deadline(monkeypatch: pytest.Monkey
     )
 
     started = time.time()
-    # The failure is a silent connection → transport error; it must surface as
-    # OTTransportError (not be masked into a generic OTConflictError) while the
-    # total wall-clock stays bounded by the 0.3s budget.
-    with pytest.raises(realtime_module.OTTransportError, match="silent connection"):
+    # A silent connection fails first in the joinProject step → transport error;
+    # it must surface as OTTransportError (not masked into OTConflictError) while
+    # the total wall-clock stays bounded by the 0.3s budget.
+    with pytest.raises(realtime_module.OTTransportError, match="joinProjectResponse"):
         client.join_doc_write(
             "0" * 24,
             "a" * 24,
@@ -1281,11 +1283,11 @@ def test_validate_edits_rejects_empty_and_whitespace_and_oversized() -> None:
 
 
 def test_join_doc_write_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    join_doc_ack = "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
+    join_doc_ack = "6:::2+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
     ot_error = "5:::" + json.dumps({"name": "otUpdateError", "args": [{"doc": "a" * 24}]})
     plans = [
-        ["1::", join_doc_ack, ot_error],
-        ["1::", join_doc_ack, "6:::2+[]"],
+        ["1::", '5:::{"name":"joinProjectResponse","args":[null]}', join_doc_ack, ot_error],
+        ["1::", '5:::{"name":"joinProjectResponse","args":[null]}', join_doc_ack, "6:::3"],
     ]
     state = {"conn": -1}
 
@@ -1347,7 +1349,9 @@ def test_ack_wait_timeout_raises_transport_error(monkeypatch: pytest.MonkeyPatch
             if self.calls == 1:
                 return "1::"
             if self.calls == 2:
-                return "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
+                return '5:::{"name":"joinProjectResponse","args":[null]}'
+            if self.calls == 3:
+                return "6:::2+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
             raise realtime_module.WebSocketTimeoutError("no ack")
 
         def _send_locked(self, _data: str) -> None:
@@ -1375,7 +1379,8 @@ def test_ack_wait_timeout_raises_transport_error(monkeypatch: pytest.MonkeyPatch
 def test_progress_completes_on_empty_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     messages = [
         "1::",
-        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+        '5:::{"name":"joinProjectResponse","args":[null]}',
+        "6:::2+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
     ]
 
     class FakeConnection:
@@ -1444,3 +1449,16 @@ def test_per_project_lock_provides_mutual_exclusion() -> None:
 
     assert not errors
     assert counter["value"] == 20
+
+
+def test_join_snapshot_lines_decodes_latin1_bytes_and_strips_crlf() -> None:
+    # "测试中文ABC。" as Latin-1-decoded UTF-8 bytes
+    mojibake = "æµ\x8bè¯\x95ä¸\xadæ\x96\x87ABCã\x80\x82"
+    result = realtime_module._join_snapshot_lines([mojibake + "\r", ""])
+    assert result == "测试中文ABC。\n"
+
+    # genuine Unicode must be left untouched (e.g. "café")
+    assert realtime_module._join_snapshot_lines(["café", "x"]) == "café\nx"
+
+    # ASCII is unchanged
+    assert realtime_module._join_snapshot_lines(["hello", "world"]) == "hello\nworld"
