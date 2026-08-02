@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import html
 import json
 import logging
@@ -9,10 +10,11 @@ import mimetypes
 import os
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -27,6 +29,28 @@ from sharelatex_mcp.validation import (
     validate_path_segment,
     validate_project_id,
 )
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _per_project_lock(method: _F) -> _F:
+    """Serialize operations on the same project.
+
+    Acquires ``self._op_lock(project_id)`` (a reentrant per-project lock) around
+    the call so background job workers and foreground tool calls sharing the
+    HTTP session / realtime channel never race on the same project.  Reentrant,
+    so nested calls are safe.  Type-preserving: the wrapped callable keeps its
+    original signature and return type for type checkers.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        project_id = kwargs["project_id"] if "project_id" in kwargs else args[0]
+        with self._op_lock(project_id):
+            return method(self, *args, **kwargs)
+
+    return cast(_F, wrapper)
+
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +168,25 @@ class ProjectClient:
         self._entity_cache: dict[str, dict[str, ProjectEntity]] = {}
         self._entity_id_index: dict[str, dict[str, str]] = {}
         self._tree_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._op_locks: dict[str, threading.RLock] = {}
+        self._op_locks_guard = threading.Lock()
         self._trusted_download_origins = {
             self._url_origin(session_manager.config.base_url)
         }
+
+    def _op_lock(self, project_id: str) -> threading.RLock:
+        """Return the per-project reentrant lock used to serialize file ops.
+
+        Guards the shared HTTP session, realtime channel, and cache for a single
+        project against concurrent access from job workers and tool calls.
+        """
+        project_id = validate_project_id(project_id)
+        with self._op_locks_guard:
+            lock = self._op_locks.get(project_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._op_locks[project_id] = lock
+            return lock
 
     def close(self) -> None:
         self.session_manager.close()
@@ -307,13 +347,21 @@ class ProjectClient:
         }
 
     def _remember_compile_download_origins(self, payload: dict[str, object]) -> None:
+        def _add_origin(url: str) -> None:
+            try:
+                self._trusted_download_origins.add(self._url_origin(url))
+            except RuntimeError:
+                # Odd-but-benign server data (e.g. userinfo in a URL) must not
+                # turn a successful compile into an exception.
+                logger.warning("Ignoring invalid compile download origin: %.80s", url)
+
         download_domain = payload.get("pdfDownloadDomain")
         if isinstance(download_domain, str) and download_domain.strip():
             normalized = self._normalize_download_domain(
                 download_domain.strip(),
                 default_scheme=urlparse(self.session_manager.config.base_url).scheme,
             )
-            self._trusted_download_origins.add(self._url_origin(normalized))
+            _add_origin(normalized)
 
         output_files = payload.get("outputFiles")
         if not isinstance(output_files, list):
@@ -323,7 +371,7 @@ class ProjectClient:
                 continue
             raw_url = item.get("url")
             if isinstance(raw_url, str) and urlparse(raw_url).scheme:
-                self._trusted_download_origins.add(self._url_origin(raw_url))
+                _add_origin(raw_url)
 
     def _store_compile_result(
         self,
@@ -607,6 +655,7 @@ class ProjectClient:
             "root_doc_path": target.path if target else None,
         }
 
+    @_per_project_lock
     def set_root_doc(self, project_id: str, path: str) -> dict[str, str | bool | None]:
         project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)
@@ -639,6 +688,7 @@ class ProjectClient:
             "changed": previous.get("root_doc_id") != current.get("root_doc_id"),
         }
 
+    @_per_project_lock
     def create_folder(
         self,
         project_id: str,
@@ -1232,6 +1282,7 @@ class ProjectClient:
             "resolved_url": resolved_url,
         }
 
+    @_per_project_lock
     def list_files_with_ids(
         self,
         project_id: str,
@@ -1315,6 +1366,7 @@ class ProjectClient:
             "resolved_url": resolved_url,
         }
 
+    @_per_project_lock
     def upload_file(
         self,
         project_id: str,
@@ -1413,6 +1465,7 @@ class ProjectClient:
             "server_response": response_payload,
         }
 
+    @_per_project_lock
     def replace_file(
         self,
         project_id: str,
@@ -1499,6 +1552,7 @@ class ProjectClient:
             "uploaded_bytes": uploaded_bytes,
         }
 
+    @_per_project_lock
     def delete_entity(self, project_id: str, entity_type: str, entity_id: str) -> dict[str, str]:
         project_id = validate_project_id(project_id)
         entity_id = validate_entity_id(entity_id)
@@ -1518,6 +1572,7 @@ class ProjectClient:
             "entity_type": entity_type,
         }
 
+    @_per_project_lock
     def rename_entity(self, project_id: str, path: str, new_name: str) -> dict[str, str]:
         project_id = validate_project_id(project_id)
         if not new_name or "/" in new_name:
@@ -1561,6 +1616,7 @@ class ProjectClient:
             "new_path": new_path,
         }
 
+    @_per_project_lock
     def move_entity(self, project_id: str, path: str, target_folder_path: str) -> dict[str, str]:
         project_id = validate_project_id(project_id)
         target = self._resolve_entity_by_path(project_id, path)

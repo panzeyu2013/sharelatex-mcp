@@ -151,8 +151,8 @@ sharelatex-mcp
   "email": "your-email@example.com",
   // 登录密码
   "password": "your-password",
-  // HTTP 请求超时秒数（默认 15）
-  "timeout_seconds": 15,
+  // HTTP 请求 / WebSocket 超时秒数（默认 60）
+  "timeout_seconds": 60,
   // 若使用 http:// 而非 https://，设为 true
   "allow_insecure_http": false,
   // 供会修改真实项目的本地验证脚本使用的可选项目 ID
@@ -169,9 +169,10 @@ sharelatex-mcp
 | `base_url` | 是 | 你的自部署 ShareLaTeX / Overleaf 基础地址 |
 | `email` | 是 | 登录邮箱 |
 | `password` | 是 | 登录密码 |
-| `timeout_seconds` | 否 | HTTP 超时秒数，默认 `15` |
+| `timeout_seconds` | 否 | HTTP / WebSocket 超时秒数，默认 `60` |
 | `allow_insecure_http` | 否 | 若你在可信局域网中使用 `http://`，设为 `true` |
 | `project_id` | 否 | 供会修改真实项目的本地验证脚本使用的 24 位项目 ID |
+| `async_write_threshold_bytes` | 否 | 内容超过该字节数时 `write`/`edit` 自动进入后台（`async_mode`）执行。默认 `262144` |
 | `log_level` | 否 | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`，默认 `INFO` |
 
 ### 4. 先做连通性验证
@@ -240,6 +241,7 @@ uv run python scripts/probe_login.py
 uv run python scripts/probe_projects.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_mcp_tools.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_async_write.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 ```
 
@@ -347,6 +349,40 @@ OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 - 如果你的实例做过较多自定义，先用
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
   验证写入链路
+
+### 大内容写入报 `-32001` / `Request timed out`
+
+`-32001` 由 **MCP 客户端** 抛出，而不是本服务。对大型文档做整文件 `write`
+天然比针对性 `edit` 慢：服务端需要下载当前快照、计算 diff，再通过实时通道发送 OT 更新。
+
+- 自 v0.1.0 起，服务端已做缓解：内容超过 `async_write_threshold_bytes`
+  （默认 256 KB）时 `write`/`edit` **自动转后台**，工具立即返回 `job_id`。
+- 在 OpenCode 中，`mcp.<名称>.timeout` 只影响“拉取工具列表”，**不会**影响
+  单次工具调用的超时。请检查你所用客户端的请求超时设置。
+- 实用缓解手段：
+  - 增量修改优先用 `edit`（最小 diff），而不是 `write`
+  - 超大内容拆分成多次 `write`/`edit` 调用
+  - 如果 Overleaf 主机或网络较慢，可调大 `~/.config/sharelatex-mcp/config.json`
+    中的 `timeout_seconds`（默认 `60`）
+  - 显式传 `async_mode=true`（或接受自动阈值），用 `get_job_status`/`wait_job` 获取结果
+- `read` 带 `offset`/`limit` 时仍会在切片前通过实时通道传输完整文档，并不会让大文件读取变便宜。
+
+### 后台（异步）写入
+
+`write`/`edit` 支持可选参数 `async_mode`：
+
+- `async_mode=true` —— 把操作放入后台队列，立即返回 `job_id`。用
+  `get_job_status(job_id)` 轮询直到状态为 `succeeded`（结果在 `result`）或
+  `failed`（错误在 `error`），或用 `wait_job(job_id, timeout_seconds)` 阻塞等待。
+- `async_mode=false` —— 强制同步执行（超大内容可能触发客户端超时）。
+- 省略 —— 自动判定：内容超过 `async_write_threshold_bytes` 时转后台。
+
+```jsonc
+// write > 256 KB → 返回 job_id
+{ "job_id": "...", "status": "queued", "async": true }
+// get_job_status → 最终
+{ "job_id": "...", "status": "succeeded", "result": { "changed": true, "path": "/main.tex" } }
+```
 
 ## 🤝 参与开发
 

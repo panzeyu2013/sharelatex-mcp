@@ -6,6 +6,7 @@ WebSocket-first read/write/edit primitives as described in the design doc.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -28,10 +29,13 @@ from sharelatex_mcp.errors import (
     FileSizeError,
     FileTypeError,
     OTConflictError,
+    OTTransportError,
     ParamValidationError,
     ProjectFileNotFoundError,
     WebSocketError,
 )
+from sharelatex_mcp.jobs import ProgressCallback
+from sharelatex_mcp.projects import _per_project_lock
 from sharelatex_mcp.validation import validate_path_segment, validate_project_id
 
 if TYPE_CHECKING:
@@ -53,10 +57,19 @@ class DocEditor:
         self._client = client
         self._realtime = client.realtime_client
 
+    def _op_lock(self, project_id: str) -> Any:
+        """Per-project reentrant lock, or a no-op for fakes without ``_op_lock``."""
+        op_lock = getattr(self._client, "_op_lock", None)
+        if callable(op_lock):
+            return op_lock(project_id)
+        return contextlib.nullcontext()
+
+
     # ------------------------------------------------------------------
     # read
     # ------------------------------------------------------------------
 
+    @_per_project_lock
     def read(
         self,
         project_id: str,
@@ -92,7 +105,15 @@ class DocEditor:
                 "Use offset/limit to read a slice."
             )
 
-        lines = content.splitlines()
+        # Split on "\n" only: this exactly mirrors the snapshot_lines the
+        # WebSocket read joins with "\n", preserving trailing empty lines and
+        # keeping line numbers consistent with how write/edit address the doc.
+        lines = content.split("\n")
+        # Strip a trailing "\r" from every line so CRLF documents read the same
+        # through the WebSocket and the HTTP-fallback path.
+        lines = [line.rstrip("\r") for line in lines]
+        if not content:
+            lines = []
         total = len(lines)
 
         if offset >= total:
@@ -125,8 +146,18 @@ class DocEditor:
     # write
     # ------------------------------------------------------------------
 
-    def write(self, project_id: str, path: str, content: str) -> dict[str, Any]:
+    @_per_project_lock
+    def write(
+        self,
+        project_id: str,
+        path: str,
+        content: str,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """Write content to a doc.  Auto-creates the file if it does not exist.
+
+        *progress* is an optional ``(done, total, message)`` callback forwarded
+        to the realtime pipeline.
 
         Returns ``{"project_id", "path", "changed", "created", "message"}``.
         """
@@ -171,8 +202,25 @@ class DocEditor:
             self._realtime.join_doc_write(
                 project_id, entity.entity_id or "",
                 _diff_fn,
+                progress=progress,
             )
-        except OTConflictError:
+        except OTTransportError:
+            # A transport failure means the update may or may not have been
+            # applied; verify by re-reading instead of reporting a spurious error.
+            try:
+                content_after, _ = self._fetch_content(project_id, entity)
+            except Exception:
+                raise
+            if content_after == content:
+                logger.info("write idempotent — content already applied (lost ack recovered)")
+                self._client._invalidate_caches(project_id)
+                return {
+                    "project_id": project_id,
+                    "path": path,
+                    "changed": True,
+                    "created": False,
+                    "message": "Write already applied (ack recovery)",
+                }
             raise
 
         changed = applied_changes[0] or not unchanged[0]
@@ -190,22 +238,30 @@ class DocEditor:
     # edit
     # ------------------------------------------------------------------
 
+    @_per_project_lock
     def edit(
         self,
         project_id: str,
         path: str,
         edits: list[dict[str, str]],
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """Apply a batch of find-and-replace edits atomically.
 
         Each edit is ``{"old": str, "new": str}``.  ``old`` must match
         exactly one location after prior edits are applied.
+
+        *progress* is an optional ``(done, total, message)`` callback forwarded
+        to the realtime pipeline.
         """
         project_id = validate_project_id(project_id)
         self._validate_edits(edits)
 
+        # Only non-identity edits actually change the document
+        applied_count = sum(1 for e in edits if e["old"] != e["new"])
+
         # All identity edits → short-circuit
-        if all(e["old"] == e["new"] for e in edits):
+        if applied_count == 0:
             return {
                 "project_id": project_id,
                 "path": path,
@@ -231,8 +287,8 @@ class DocEditor:
             return convert_ot_positions_to_utf16(ops, current)
 
         try:
-            self._realtime.join_doc_write(project_id, doc_id, _diff_fn)
-        except (OTConflictError, EditMatchError) as ot_exc:
+            self._realtime.join_doc_write(project_id, doc_id, _diff_fn, progress=progress)
+        except (OTConflictError, EditMatchError, OTTransportError) as ot_exc:
             try:
                 content, _ = self._fetch_content(project_id, entity)
             except Exception:
@@ -245,7 +301,7 @@ class DocEditor:
                     "project_id": project_id,
                     "path": path,
                     "changed": True,
-                    "edits_applied": len(edits),
+                    "edits_applied": applied_count,
                     "message": "Edits were already applied (ack recovery)",
                 }
             raise
@@ -255,7 +311,7 @@ class DocEditor:
             "project_id": project_id,
             "path": path,
             "changed": True,
-            "edits_applied": len(edits),
+            "edits_applied": applied_count,
             "message": "Edits applied",
         }
 
@@ -293,7 +349,12 @@ class DocEditor:
             )
             if result.status_code != 200:
                 raise FileReadError(f"HTTP download failed, status {result.status_code}")
-            return result.text, "http_fallback"
+            # Normalize CRLF to LF so the fallback text matches the WebSocket
+            # snapshot representation (see realtime._join_snapshot_lines).
+            normalized = "\n".join(
+                line.rstrip("\r") for line in result.text.split("\n")
+            )
+            return normalized, "http_fallback"
         except Exception:
             raise FileReadError("Both WebSocket and HTTP reads are unavailable") from None
 
@@ -344,6 +405,11 @@ class DocEditor:
         if not name:
             raise ParamValidationError("path must include a filename")
 
+        # Normalize before resolving: entity paths are stored with a leading "/"
+        parent_path = parent_path.rstrip("/") or "/"
+        if not parent_path.startswith("/"):
+            parent_path = "/" + parent_path
+
         # Resolve parent folder
         try:
             parent_folder_id, _ = self._client._resolve_folder_id_by_path(
@@ -379,9 +445,6 @@ class DocEditor:
             raise RuntimeError("Document created but no document ID returned")
 
         entity_id = validate_path_segment(entity_id, "doc_id")
-        # Ensure path always starts with /
-        if not parent_path.startswith("/"):
-            parent_path = "/" + parent_path
         doc_path = f"{parent_path}/{name}" if parent_path != "/" else f"/{name}"
 
         # Write content via WebSocket first — only cache on success

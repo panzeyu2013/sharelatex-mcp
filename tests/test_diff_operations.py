@@ -196,6 +196,43 @@ def test_edit_preserves_decomposed_unicode_representation() -> None:
     assert _apply_ops(current, operations) == "coffee"
 
 
+def test_diff_falls_back_to_full_replace_when_max_ops_exceeded(monkeypatch) -> None:
+    import sharelatex_mcp.diff_engine as diff_engine
+
+    monkeypatch.setattr(diff_engine, "MAX_DIFF_OPS", 5)
+    old = "ab" * 50
+    new = "ac" * 50
+    ops = compute_diff_operations(old, new)
+    assert len(ops) == 2
+    assert _apply_ops(old, ops) == new
+
+
+def test_make_full_replace_of_empty_inputs_is_empty(monkeypatch) -> None:
+    import sharelatex_mcp.diff_engine as diff_engine
+
+    assert diff_engine._make_full_replace("", "") == []
+
+
+def test_identity_edits_are_not_uniqueness_validated(monkeypatch) -> None:
+    import sharelatex_mcp.diff_engine as diff_engine
+    from sharelatex_mcp.errors import EditMatchError
+
+    # "dup" appears twice, but as an identity edit it must be skipped silently
+    current = "dup dup other"
+    ops, modified = diff_engine._compute_edit_operations(
+        current,
+        [{"old": "dup", "new": "dup"}, {"old": "other", "new": "other2"}],
+    )
+    assert modified == "dup dup other2"
+    assert _apply_ops(current, ops) == modified
+
+    with pytest.raises(EditMatchError):
+        diff_engine._compute_edit_operations(
+            current,
+            [{"old": "dup", "new": "x"}, {"old": "other", "new": "y"}],
+        )
+
+
 def test_lost_ack_recovery_requires_exact_expected_content() -> None:
     expected = "hello new world"
     assert check_edits_already_applied(expected, expected)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,15 +32,24 @@ class OverleafSessionManager:
         self.config = config
         self.http = HttpClient(config.base_url, config.timeout_seconds)
         self._csrf_token: str | None = None
+        # Serializes login / CSRF / cookie mutations so concurrent background
+        # job workers and foreground tool calls never race on the shared
+        # requests.Session state.
+        self._state_lock = threading.RLock()
 
     def close(self) -> None:
         self.http.close()
 
     def invalidate_login(self) -> None:
-        self._csrf_token = None
-        self.http.session.cookies.clear()
+        with self._state_lock:
+            self._csrf_token = None
+            self.http.session.cookies.clear()
 
     def login(self) -> None:
+        with self._state_lock:
+            self._login_locked()
+
+    def _login_locked(self) -> None:
         logger.info("Attempting login to %s", self.config.base_url)
         login_page = self.http.get("/login")
         if login_page.status_code != 200:
@@ -88,18 +98,19 @@ class OverleafSessionManager:
         if project_id is not None:
             project_id = validate_project_id(project_id)
 
-        if self._csrf_token and not force_refresh:
+        with self._state_lock:
+            if self._csrf_token and not force_refresh:
+                return self._csrf_token
+
+            self.ensure_logged_in()
+
+            if not force_refresh and self._csrf_token:
+                return self._csrf_token
+
+            path = f"/project/{project_id}" if project_id else "/project"
+            logger.debug("Fetching CSRF token from %s", path)
+            project_page = self.http.get(path)
+            if not 200 <= project_page.status_code < 300:
+                raise RuntimeError(f"Failed to read CSRF page, status code: {project_page.status_code}")
+            self._csrf_token = _extract_csrf(project_page.text)
             return self._csrf_token
-
-        self.ensure_logged_in()
-
-        if not force_refresh and self._csrf_token:
-            return self._csrf_token
-
-        path = f"/project/{project_id}" if project_id else "/project"
-        logger.debug("Fetching CSRF token from %s", path)
-        project_page = self.http.get(path)
-        if not 200 <= project_page.status_code < 300:
-            raise RuntimeError(f"Failed to read CSRF page, status code: {project_page.status_code}")
-        self._csrf_token = _extract_csrf(project_page.text)
-        return self._csrf_token

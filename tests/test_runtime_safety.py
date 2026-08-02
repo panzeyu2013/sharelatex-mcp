@@ -12,9 +12,16 @@ from requests.structures import CaseInsensitiveDict
 
 import sharelatex_mcp.config as config_module
 import sharelatex_mcp.realtime as realtime_module
-from sharelatex_mcp.diff_engine import compute_diff_operations
+from sharelatex_mcp.diff_engine import MAX_FILE_SIZE, compute_diff_operations
 from sharelatex_mcp.doc_editor import DocEditor
-from sharelatex_mcp.errors import OTConflictError
+from sharelatex_mcp.errors import (
+    CacheConsistencyError,
+    FileSizeError,
+    FileTypeError,
+    OTConflictError,
+    OTTransportError,
+    ParamValidationError,
+)
 from sharelatex_mcp.http import BinaryHttpResult, HttpResult
 from sharelatex_mcp.projects import ProjectClient, ProjectEntity
 from sharelatex_mcp.session import OverleafSessionManager
@@ -496,7 +503,7 @@ def test_compile_project_rejects_unbounded_control_parameters(
 
 def test_edit_lost_ack_recovery_compares_exact_submitted_content() -> None:
     class FakeRealtime:
-        def join_doc_write(self, project_id, doc_id, diff_fn) -> None:
+        def join_doc_write(self, project_id, doc_id, diff_fn, progress=None) -> None:
             diff_fn("hello old world")
             raise OTConflictError("ack lost")
 
@@ -526,7 +533,7 @@ def test_edit_lost_ack_recovery_compares_exact_submitted_content() -> None:
 
 def test_edit_lost_ack_recovery_rejects_unrelated_content() -> None:
     class FakeRealtime:
-        def join_doc_write(self, project_id, doc_id, diff_fn) -> None:
+        def join_doc_write(self, project_id, doc_id, diff_fn, progress=None) -> None:
             diff_fn("hello old world")
             raise OTConflictError("ack lost")
 
@@ -649,3 +656,791 @@ def test_write_falls_back_to_full_replace_on_large_diff() -> None:
     result = compute_diff_operations(old, new)
     # Full replacement: delete all of old, insert all of new
     assert result == [{"p": 0, "d": old}, {"p": 0, "i": new}]
+
+
+def test_read_reports_trailing_newline_line_count() -> None:
+    """read must split on \\n only so a trailing newline keeps its final empty line."""
+    realtime = SimpleNamespace(join_doc_read=lambda _project_id, _doc_id: "line1\nline2\n")
+    client = SimpleNamespace(
+        realtime_client=realtime,
+        _resolve_entity_by_path=lambda _project_id, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _project_id: None,
+    )
+
+    result = DocEditor(client).read("0" * 24, "/main.tex")
+
+    assert result["total_lines"] == 3
+    assert result["returned_lines"] == 3
+    assert result["content"] == "1: line1\n2: line2\n3: "
+
+
+def test_read_splits_on_newline_only_not_other_separators() -> None:
+    """splitlines() splits on \\r/\\x0b/\\u2028 etc.; read must not, or line numbers diverge."""
+    realtime = SimpleNamespace(
+        join_doc_read=lambda _project_id, _doc_id: "a\x0bb\nc",
+    )
+    client = SimpleNamespace(
+        realtime_client=realtime,
+        _resolve_entity_by_path=lambda _project_id, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _project_id: None,
+    )
+
+    result = DocEditor(client).read("0" * 24, "/main.tex")
+
+    assert result["total_lines"] == 2
+    assert result["content"] == "1: a\x0bb\n2: c"
+
+
+def test_write_create_normalizes_parent_path_before_resolve() -> None:
+    """write to 'chapters/intro.tex' must resolve the '/chapters' folder."""
+    resolved_folders: list[str] = []
+
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, _diff_fn, progress=None) -> None:
+            return None
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _project_id, _path: (_ for _ in ()).throw(
+            RuntimeError("not found")
+        ),
+        _resolve_folder_id_by_path=lambda _project_id, folder_path: (
+            resolved_folders.append(folder_path) or ("f" * 24, folder_path)
+        ),
+        _post_json_with_csrf=lambda **_kwargs: HttpResult(
+            status_code=200,
+            headers=CaseInsensitiveDict(),
+            text=json.dumps({"_id": "a" * 24}),
+            url="https://overleaf.example/project/doc",
+        ),
+        _delete_with_csrf=lambda **_kwargs: HttpResult(
+            status_code=200,
+            headers=CaseInsensitiveDict(),
+            text="",
+            url="https://overleaf.example/project/doc",
+        ),
+        _cache_upsert=lambda *_args, **_kwargs: None,
+        _invalidate_caches=lambda _project_id: None,
+    )
+
+    result = DocEditor(client).write("0" * 24, "chapters/intro.tex", "hello")
+
+    assert resolved_folders == ["/chapters"]
+    assert result["created"] is True
+    assert result["path"] == "/chapters/intro.tex"
+
+
+def test_edit_applied_count_excludes_identity_edits() -> None:
+    """edits_applied must count only edits that actually change the document."""
+
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, diff_fn, progress=None) -> None:
+            diff_fn("hello world")
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _project_id, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _project_id: None,
+    )
+
+    result = DocEditor(client).edit(
+        "0" * 24,
+        "/main.tex",
+        [{"old": "hello", "new": "hello"}, {"old": "world", "new": "planet"}],
+    )
+
+    assert result["changed"] is True
+    assert result["edits_applied"] == 1
+
+
+@pytest.mark.timeout(5)
+def test_wait_for_ack_fails_fast_when_connection_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped connection must fail fast instead of spinning until the ack deadline."""
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+        def recv(self) -> str:
+            self.calls += 1
+            if self.calls <= 2:
+                return "1::"
+            if self.calls == 3:
+                return "6:::1+" + json.dumps(
+                    [None, ["hello world"], 7, [], {}, "sharejs-text-ot"]
+                )
+            raise realtime_module.WebSocketError("connection closed")
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(realtime_module.OTTransportError, match="connection lost"):
+        client.join_doc_write(
+            "0" * 24,
+            "a" * 24,
+            lambda _content: [{"p": 6, "i": "there "}],
+        )
+
+
+def test_wait_for_ack_uses_heartbeat_aware_recv_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recv waits must be at least the socket.io heartbeat interval so inline
+    heartbeat replies keep the connection alive."""
+    seen_timeouts: list[float] = []
+    messages = [
+        "1::",
+        "1::",
+        "6:::1+" + json.dumps([None, ["hello world"], 7, [], {}, "sharejs-text-ot"]),
+        "6:::2+[]",
+    ]
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda t: seen_timeouts.append(t)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            return messages.pop(0)
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=15),
+        SimpleNamespace(),
+    )
+
+    client.join_doc_write(
+        "0" * 24,
+        "a" * 24,
+        lambda _content: [{"p": 6, "i": "there "}],
+    )
+
+    assert any(t >= realtime_module._HEARTBEAT_INTERVAL_SECONDS for t in seen_timeouts)
+    # The socket timeout must be reset to the configured value before sending
+    # the OT payload, so a slow send is not throttled by the leftover
+    # per-recv timeout from the joinDoc phase.
+    assert 15 in seen_timeouts
+
+
+class _LockStub:
+    def __init__(self, records: list, project_id: str) -> None:
+        self._records = records
+        self._project_id = project_id
+
+    def __enter__(self):
+        self._records.append(("acquire", self._project_id))
+
+    def __exit__(self, *_args):
+        self._records.append(("release", self._project_id))
+        return False
+
+
+def test_per_project_lock_is_shared_and_reentrant() -> None:
+    client = _make_project_client()
+
+    lock_a = client._op_lock("0" * 24)
+    assert lock_a is client._op_lock("0" * 24)
+    assert client._op_lock("1" * 24) is not lock_a
+
+    with lock_a, client._op_lock("0" * 24):  # reentrant
+        pass
+
+
+def test_per_project_lock_handles_all_keyword_calls() -> None:
+    """The decorator must not crash when project_id is passed by keyword only."""
+    import threading
+    import types
+
+    from sharelatex_mcp.projects import _per_project_lock
+
+    records: list[str] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._locks: dict[str, threading.RLock] = {}
+
+        def _op_lock(self, project_id: str) -> threading.RLock:
+            return self._locks.setdefault(project_id, threading.RLock())
+
+    @_per_project_lock
+    def op(self, project_id: str, name: str) -> str:
+        records.append(project_id)
+        return name
+
+    fake = FakeClient()
+    bound = types.MethodType(op, fake)
+
+    assert bound(project_id="0" * 24, name="x") == "x"
+    assert bound(project_id="1" * 24, name="y") == "y"
+    assert records == ["0" * 24, "1" * 24]
+
+
+def test_doc_editor_read_acquires_per_project_lock() -> None:
+    records: list = []
+    realtime = SimpleNamespace(
+        join_doc_read=lambda _project_id, _doc_id: "line1\nline2\n",
+    )
+    client = SimpleNamespace(
+        realtime_client=realtime,
+        _resolve_entity_by_path=lambda _project_id, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _project_id: None,
+        _op_lock=lambda project_id: _LockStub(records, project_id),
+    )
+
+    DocEditor(client).read("0" * 24, "/main.tex")
+
+    assert records == [("acquire", "0" * 24), ("release", "0" * 24)]
+
+
+def test_join_doc_write_reports_progress_stages(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages = [
+        "1::",
+        "1::",
+        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+        "6:::2+[]",
+    ]
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            return messages.pop(0)
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    events: list[tuple[int, int]] = []
+
+    client.join_doc_write(
+        "0" * 24,
+        "a" * 24,
+        lambda _content: [{"p": 6, "i": "there "}],
+        progress=lambda done, total, _message: events.append((done, total)),
+    )
+
+    assert events == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+@pytest.mark.timeout(5)
+def test_ot_update_error_is_reported_as_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages = [
+        "1::",
+        "1::",
+        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+        "5:::" + json.dumps({"name": "otUpdateError", "args": [{"doc": "a" * 24}]}),
+    ]
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+            self._messages = list(messages)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            return self._messages.pop(0)
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(OTConflictError, match="applyOtUpdate error"):
+        client.join_doc_write(
+            "0" * 24,
+            "a" * 24,
+            lambda _content: [{"p": 6, "i": "there "}],
+        )
+
+
+@pytest.mark.timeout(5)
+def test_join_doc_write_bounds_total_time_by_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            raise realtime_module.WebSocketTimeoutError("silent connection")
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 2) -> None:
+            return None
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    started = time.time()
+    # The failure is a silent connection → transport error; it must surface as
+    # OTTransportError (not be masked into a generic OTConflictError) while the
+    # total wall-clock stays bounded by the 0.3s budget.
+    with pytest.raises(realtime_module.OTTransportError, match="silent connection"):
+        client.join_doc_write(
+            "0" * 24,
+            "a" * 24,
+            lambda _content: [{"p": 0, "i": "x"}],
+            timeout=0.3,
+        )
+    assert time.time() - started < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Additional review-driven tests: read edge cases, write recovery, rollback,
+# retry paths, validation, progress, lock mutual exclusion
+# ---------------------------------------------------------------------------
+
+
+def test_read_handles_crlf_and_empty_and_slicing() -> None:
+    def make_client(join_doc_read):
+        realtime = SimpleNamespace(join_doc_read=join_doc_read)
+        return SimpleNamespace(
+            realtime_client=realtime,
+            _resolve_entity_by_path=lambda _p, _path: ProjectEntity(
+                path="/main.tex", type="doc", entity_id="a" * 24,
+            ),
+            _invalidate_caches=lambda _p: None,
+        )
+
+    # CRLF content is normalized per line; a trailing newline keeps its empty line
+    crlf = DocEditor(make_client(lambda _p, _d: "a\r\nb\r\n")).read("0" * 24, "/main.tex")
+    assert crlf["total_lines"] == 3
+    assert crlf["content"] == "1: a\n2: b\n3: "
+
+    # empty doc -> no lines, no phantom "1: "
+    empty = DocEditor(make_client(lambda _p, _d: "")).read("0" * 24, "/main.tex")
+    assert empty["total_lines"] == 0
+    assert empty["content"] == ""
+
+    # offset beyond the end -> empty result
+    sliced = DocEditor(make_client(lambda _p, _d: "a\nb")).read(
+        "0" * 24, "/main.tex", offset=5
+    )
+    assert sliced["returned_lines"] == 0
+    assert sliced["content"] == ""
+
+    # offset/limit slicing
+    sliced = DocEditor(make_client(lambda _p, _d: "a\nb\nc\nd")).read(
+        "0" * 24, "/main.tex", offset=1, limit=2
+    )
+    assert sliced["content"] == "2: b\n3: c"
+
+
+def test_read_rejects_oversized_full_read_and_non_doc_entity() -> None:
+    def make_client(join_doc_read, entity):
+        realtime = SimpleNamespace(join_doc_read=join_doc_read)
+        return SimpleNamespace(
+            realtime_client=realtime,
+            _resolve_entity_by_path=lambda _p, _path: entity,
+            _invalidate_caches=lambda _p: None,
+        )
+
+    big = "x" * (MAX_FILE_SIZE + 1)
+    with pytest.raises(FileSizeError):
+        big_entity = ProjectEntity(path="/b.tex", type="doc", entity_id="a" * 24)
+        DocEditor(make_client(lambda _p, _d: big, big_entity)).read("0" * 24, "/b.tex")
+
+    with pytest.raises(FileTypeError):
+        img_entity = ProjectEntity(path="/img.png", type="fileRef", entity_id="a" * 24)
+        DocEditor(make_client(lambda _p, _d: "x", img_entity)).read("0" * 24, "/img.png")
+
+
+def test_write_reports_unchanged_when_content_matches() -> None:
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, diff_fn, progress=None) -> None:
+            assert diff_fn("same content") == []
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _p, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _p: None,
+    )
+
+    result = DocEditor(client).write("0" * 24, "/main.tex", "same content")
+
+    assert result["changed"] is False
+    assert "unchanged" in result["message"]
+
+
+def test_write_lost_ack_recovery_on_transport_error() -> None:
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, _diff_fn, progress=None) -> None:
+            raise OTTransportError("ack lost")
+
+        def join_doc_read(self, _project_id, _doc_id) -> str:
+            return "the content"
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _p, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _p: None,
+    )
+
+    result = DocEditor(client).write("0" * 24, "/main.tex", "the content")
+
+    assert result["changed"] is True
+    assert result["message"] == "Write already applied (ack recovery)"
+
+
+def test_write_lost_ack_recovery_rejects_unrelated_content() -> None:
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, _diff_fn, progress=None) -> None:
+            raise OTTransportError("ack lost")
+
+        def join_doc_read(self, _project_id, _doc_id) -> str:
+            return "concurrent unrelated edit"
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _p, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _p: None,
+    )
+
+    with pytest.raises(OTTransportError, match="ack lost"):
+        DocEditor(client).write("0" * 24, "/main.tex", "the content")
+
+
+def test_edit_lost_ack_recovery_on_transport_error() -> None:
+    class FakeRealtime:
+        def join_doc_write(self, _project_id, _doc_id, diff_fn, progress=None) -> None:
+            diff_fn("hello old world")
+            raise OTTransportError("ack lost")
+
+        def join_doc_read(self, _project_id, _doc_id) -> str:
+            return "hello new world"
+
+    client = SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _p, _path: ProjectEntity(
+            path="/main.tex", type="doc", entity_id="a" * 24,
+        ),
+        _invalidate_caches=lambda _p: None,
+    )
+
+    result = DocEditor(client).edit(
+        "0" * 24, "/main.tex", [{"old": "old", "new": "new"}]
+    )
+
+    assert result["message"] == "Edits were already applied (ack recovery)"
+
+
+def _rollback_client(delete_status: dict) -> SimpleNamespace:
+    class FakeRealtime:
+        def join_doc_write(self, *_args, **_kwargs) -> None:
+            raise OTTransportError("network down")
+
+    return SimpleNamespace(
+        realtime_client=FakeRealtime(),
+        _resolve_entity_by_path=lambda _p, _path: (_ for _ in ()).throw(
+            RuntimeError("not found")
+        ),
+        _resolve_folder_id_by_path=lambda _p, folder: ("f" * 24, folder),
+        _post_json_with_csrf=lambda **_k: HttpResult(
+            status_code=200,
+            headers=CaseInsensitiveDict(),
+            text=json.dumps({"_id": "a" * 24}),
+            url="https://overleaf.example/project/doc",
+        ),
+        _delete_with_csrf=lambda **_k: HttpResult(
+            status_code=delete_status["code"],
+            headers=CaseInsensitiveDict(),
+            text="",
+            url="https://overleaf.example/project/doc",
+        ),
+        _cache_upsert=lambda *_a, **_k: None,
+        _invalidate_caches=lambda _p: None,
+    )
+
+
+def test_write_create_rolls_back_orphan_when_insert_fails() -> None:
+    client = _rollback_client({"code": 200})
+
+    with pytest.raises(OTTransportError, match="network down"):
+        DocEditor(client).write("0" * 24, "/new.tex", "hi")
+
+
+def test_write_create_rollback_failure_raises_cache_consistency() -> None:
+    client = _rollback_client({"code": 500})
+
+    with pytest.raises(CacheConsistencyError):
+        DocEditor(client).write("0" * 24, "/new.tex", "hi")
+
+
+def test_validate_edits_rejects_empty_and_whitespace_and_oversized() -> None:
+    editor = DocEditor(SimpleNamespace(realtime_client=SimpleNamespace()))
+
+    with pytest.raises(ParamValidationError):
+        editor._validate_edits([])
+    with pytest.raises(ParamValidationError):
+        editor._validate_edits([{"old": "  ", "new": "x"}])
+    with pytest.raises(ParamValidationError):
+        editor._validate_edits([{"old": "x" * 20000, "new": "y"}])  # old > 10 KB
+    with pytest.raises(ParamValidationError):
+        editor._validate_edits([{"old": "x" * 10, "new": "y" * (600 * 1024)}])  # new > 500 KB
+
+
+def test_join_doc_write_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    join_doc_ack = "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
+    ot_error = "5:::" + json.dumps({"name": "otUpdateError", "args": [{"doc": "a" * 24}]})
+    plans = [
+        ["1::", join_doc_ack, ot_error],
+        ["1::", join_doc_ack, "6:::2+[]"],
+    ]
+    state = {"conn": -1}
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            state["conn"] += 1
+            self._plan = list(plans[min(state["conn"], len(plans) - 1)])
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            return self._plan.pop(0)
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    client.join_doc_write(
+        "0" * 24, "a" * 24, lambda _content: [{"p": 6, "i": "there "}]
+    )
+
+    assert state["conn"] == 1  # one conflict, one successful retry
+
+
+@pytest.mark.timeout(5)
+def test_ack_wait_timeout_raises_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.calls = 0
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                return "1::"
+            if self.calls == 2:
+                return "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"])
+            raise realtime_module.WebSocketTimeoutError("no ack")
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    with pytest.raises(OTTransportError, match="Timed out waiting for ack"):
+        client.join_doc_write(
+            "0" * 24, "a" * 24, lambda _content: [{"p": 6, "i": "there "}], timeout=0.3
+        )
+
+
+def test_progress_completes_on_empty_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages = [
+        "1::",
+        "6:::1+" + json.dumps([None, ["hello"], 3, [], {}, "sharejs-text-ot"]),
+    ]
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self._messages = list(messages)
+            self.ws = SimpleNamespace()
+            self.ws.settimeout = lambda _t: None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def recv(self) -> str:
+            return self._messages.pop(0)
+
+        def _send_locked(self, _data: str) -> None:
+            return None
+
+        def drain_initial_messages(self, _expected_count: int = 1) -> None:
+            for _ in range(_expected_count):
+                self.recv()
+
+        def send_event_with_ack(self, *_args, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(realtime_module, "LegacySocketConnection", FakeConnection)
+    client = realtime_module.RealtimeProjectClient(
+        SimpleNamespace(timeout_seconds=60),
+        SimpleNamespace(),
+    )
+
+    events: list[tuple[int, int]] = []
+
+    client.join_doc_write(
+        "0" * 24, "a" * 24, lambda _content: [],  # empty ops → no OT round-trip
+        progress=lambda done, total, _m: events.append((done, total)),
+    )
+
+    assert events == [(1, 4), (2, 4), (4, 4)]
+
+
+def test_per_project_lock_provides_mutual_exclusion() -> None:
+    import threading
+
+    client = _make_project_client()
+    lock = client._op_lock("0" * 24)
+    counter = {"value": 0}
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            with lock:
+                value = counter["value"]
+                time.sleep(0.005)
+                counter["value"] = value + 1
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert counter["value"] == 20

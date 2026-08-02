@@ -1,20 +1,74 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from dataclasses import asdict
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+from mcp.server.fastmcp import Context, FastMCP
 
-from sharelatex_mcp.config import load_config
+from sharelatex_mcp.config import AppConfig, load_config
+from sharelatex_mcp.diff_engine import MAX_FILE_SIZE
 from sharelatex_mcp.doc_editor import DocEditor
+from sharelatex_mcp.errors import FileSizeError
+from sharelatex_mcp.jobs import JobStore, ProgressCallback
 from sharelatex_mcp.projects import ProjectClient
 from sharelatex_mcp.session import OverleafSessionManager
 
+logger = logging.getLogger(__name__)
 
-def create_server() -> FastMCP:
-    config = load_config()
+
+def create_server(
+    config: AppConfig | None = None,
+    project_client: ProjectClient | None = None,
+    job_store: JobStore | None = None,
+) -> FastMCP:
+    """Build the MCP server.
+
+    Optional *config* / *project_client* / *job_store* overrides are for tests.
+    """
+    config = config if config is not None else load_config()
     session_manager = OverleafSessionManager(config)
-    project_client = ProjectClient(session_manager)
+    project_client = project_client if project_client is not None else ProjectClient(session_manager)
     doc_editor = DocEditor(project_client)
+    job_store = job_store if job_store is not None else JobStore()
+
+    def _submit_job(operation: str, project_id: str, fn) -> dict:
+        job_id = job_store.submit(operation, project_id, fn)
+        return {
+            "job_id": job_id,
+            "operation": operation,
+            "project_id": project_id,
+            "status": "queued",
+            "async": True,
+            "message": (
+                "Running in the background. Poll get_job_status or block "
+                "with wait_job to retrieve the result."
+            ),
+        }
+
+    def _wire_progress(ctx: Context) -> ProgressCallback:
+        """Return a progress callback that forwards to MCP on the event loop.
+
+        Called from ``anyio.to_thread.run_sync`` worker threads, which are
+        anyio-managed, so ``anyio.from_thread.run`` can schedule the async
+        ``report_progress`` onto the server loop without a cross-thread token.
+        """
+        warned = False
+
+        def report(done: int, total: int, message: str | None) -> None:
+            nonlocal warned
+            try:
+                anyio.from_thread.run(ctx.report_progress, done, total, message)
+            except Exception:
+                if not warned:
+                    warned = True
+                    logger.warning("Progress notification failed; progress will be silent", exc_info=True)
+                else:
+                    logger.debug("Progress notification failed", exc_info=True)
+
+        return report
 
     mcp = FastMCP(
         name="sharelatex-mcp",
@@ -100,7 +154,10 @@ def create_server() -> FastMCP:
             "with optional line-range slicing. Returns line-numbered content. "
             "Use offset/limit for large files. "
             "Path must start with / and match the project-internal path. "
-            "For binary files use download_file."
+            "For binary files use download_file. "
+            "Note: offset/limit slicing is applied after the full document is "
+            "transferred, so very large files are still costly to read; prefer "
+            "'edit' for targeted changes."
         ),
     )
     def read(
@@ -177,11 +234,37 @@ def create_server() -> FastMCP:
             "Write content to a doc-type text file. Auto-creates the file if "
             "it does not already exist. Uses socket.io + sharejs-text-ot to "
             "apply minimal character-level diffs. For binary files use "
-            "upload_file or replace_file."
+            "upload_file or replace_file. "
+            "Very large content is automatically run in the background "
+            "(async_mode=true) to avoid client request timeouts; the tool then "
+            "returns a job_id to poll with get_job_status or wait_job. Pass "
+            "async_mode=false to force synchronous execution."
         ),
     )
-    def write(project_id: str, path: str, content: str) -> dict:
-        return doc_editor.write(project_id, path, content)
+    async def write(
+        project_id: str,
+        path: str,
+        content: str,
+        async_mode: bool | None = None,
+        ctx: Context | None = None,
+    ) -> dict:
+        content_bytes = len(content.encode("utf-8"))
+        # Validate the size before routing so oversized input fails fast with a
+        # clear error instead of being queued (and holding the content in memory).
+        if content_bytes > MAX_FILE_SIZE:
+            raise FileSizeError(f"Content exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit")
+        if async_mode is None:
+            async_mode = content_bytes > config.async_write_threshold_bytes
+        if async_mode:
+            return _submit_job(
+                "write", project_id, lambda: doc_editor.write(project_id, path, content)
+            )
+        if ctx is None:
+            return await anyio.to_thread.run_sync(doc_editor.write, project_id, path, content)
+        progress = _wire_progress(ctx)
+        return await anyio.to_thread.run_sync(
+            doc_editor.write, project_id, path, content, progress
+        )
 
     @mcp.tool(
         name="edit",
@@ -189,15 +272,81 @@ def create_server() -> FastMCP:
             "Apply precise find-and-replace edits to a doc-type text file. "
             "Each edit has 'old' (text to find, must match exactly one location) "
             "and 'new' (replacement text). Multiple edits are applied atomically "
-            "in a single operation. For full-file writes use 'write' instead."
+            "in a single operation. For full-file writes use 'write' instead. "
+            "Large edit batches are automatically run in the background "
+            "(async_mode=true); the tool then returns a job_id to poll with "
+            "get_job_status or wait_job. Pass async_mode=false to force "
+            "synchronous execution."
         ),
     )
-    def edit(
+    async def edit(
         project_id: str,
         path: str,
         edits: list[dict[str, str]],
+        async_mode: bool | None = None,
+        ctx: Context | None = None,
     ) -> dict:
-        return doc_editor.edit(project_id, path, edits)
+        # Validate the batch before routing so invalid edits fail fast with a
+        # clear error instead of being queued and failing in the background.
+        doc_editor._validate_edits(edits)
+        edit_bytes = sum(
+            len(e["old"].encode("utf-8")) + len(e["new"].encode("utf-8"))
+            for e in edits
+        )
+        if async_mode is None:
+            async_mode = edit_bytes > config.async_write_threshold_bytes
+        if async_mode:
+            return _submit_job(
+                "edit", project_id, lambda: doc_editor.edit(project_id, path, edits)
+            )
+        if ctx is None:
+            return await anyio.to_thread.run_sync(doc_editor.edit, project_id, path, edits)
+        progress = _wire_progress(ctx)
+        return await anyio.to_thread.run_sync(
+            doc_editor.edit, project_id, path, edits, progress
+        )
+
+    @mcp.tool(
+        name="get_job_status",
+        description=(
+            "Get the status and result of a background job returned by write/edit "
+            "when running in async mode. Returns status (queued/running/succeeded/"
+            "failed), the result payload on success, or an error message on failure."
+        ),
+    )
+    def get_job_status(job_id: str) -> dict:
+        snapshot = job_store.status(job_id)
+        if snapshot is None:
+            return {"job_id": job_id, "status": "not-found"}
+        return snapshot
+
+    @mcp.tool(
+        name="wait_job",
+        description=(
+            "Block until a background job finishes (or the timeout elapses), "
+            "returning its status and result. For long waits prefer get_job_status "
+            "polling so the client request is not held open."
+        ),
+    )
+    async def wait_job(job_id: str, timeout_seconds: float = 30.0) -> dict:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 <= timeout_seconds <= 300
+        ):
+            raise RuntimeError("timeout_seconds must be between 0 and 300")
+        deadline = time.monotonic() + float(timeout_seconds)
+        while True:
+            snapshot = job_store.status(job_id)
+            if snapshot is None:
+                return {"job_id": job_id, "status": "not-found"}
+            if snapshot["status"] in {"succeeded", "failed"}:
+                return snapshot
+            if time.monotonic() >= deadline:
+                snapshot = dict(snapshot)
+                snapshot["timed_out"] = True
+                return snapshot
+            await asyncio.sleep(0.05)
 
     # ==================================================================
     # File CRUD

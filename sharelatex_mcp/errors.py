@@ -66,6 +66,17 @@ class OTConflictError(SharelatexError):
     pass
 
 
+class OTTransportError(SharelatexError):
+    """WebSocket transport failure (connection dropped, timeout) during an OT write.
+
+    Distinguished from :class:`OTConflictError`: a transport failure means the
+    update may or may not have been applied, so callers should verify state
+    (e.g. via the edit lost-ack recovery check) rather than assume a conflict.
+    """
+
+    pass
+
+
 class FileTypeError(SharelatexError):
     """Operation attempted on wrong entity type (e.g. read on fileRef)."""
 

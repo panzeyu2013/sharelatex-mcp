@@ -81,6 +81,8 @@ def compute_diff_operations(old: str, new: str) -> list[dict[str, Any]]:
 
 def _make_full_replace(old: str, new: str) -> list[dict[str, Any]]:
     """Return operations that delete *old* entirely and insert *new*."""
+    if not old and not new:
+        return []
     if not new:
         return [{"p": 0, "d": old}]
     if not old:
@@ -337,8 +339,15 @@ def _compute_edit_operations(
     if not edits:
         return [], current
 
+    # Identity edits are no-ops: skip them entirely so they are not subjected
+    # to the uniqueness check (an identity "old" that matches multiple locations
+    # would otherwise fail the batch for a change that never happens).
+    non_identity = [e for e in edits if e["old"] != e["new"]]
+    if not non_identity:
+        return [], current
+
     # Step 1: sort + initial uniqueness check on original current
-    sorted_edits = sort_edits_by_position(edits, current, reverse=True)
+    sorted_edits = sort_edits_by_position(non_identity, current, reverse=True)
 
     # Step 2: validate & apply each edit on progressively-modified text
     modified = current

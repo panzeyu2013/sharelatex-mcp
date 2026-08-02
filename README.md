@@ -164,8 +164,8 @@ This creates `~/.config/sharelatex-mcp/config.json` and exits. Edit it with your
   "email": "your-email@example.com",
   // Login password
   "password": "your-password",
-  // HTTP request timeout in seconds (default: 15)
-  "timeout_seconds": 15,
+  // HTTP request / WebSocket timeout in seconds (default: 60)
+  "timeout_seconds": 60,
   // Set to true if you are using http:// instead of https://
   "allow_insecure_http": false,
   // Optional project id used by destructive local validation scripts
@@ -182,9 +182,10 @@ Configuration fields:
 | `base_url` | Yes | Base URL of your self-hosted ShareLaTeX / Overleaf instance |
 | `email` | Yes | Login email |
 | `password` | Yes | Login password |
-| `timeout_seconds` | No | HTTP timeout in seconds. Default: `15` |
+| `timeout_seconds` | No | HTTP / WebSocket timeout in seconds. Default: `60` |
 | `allow_insecure_http` | No | Set `true` if you are using plain `http://` in a trusted local network |
 | `project_id` | No | Optional 24-character project id used by local validation scripts that modify a real project |
+| `async_write_threshold_bytes` | No | Content size in bytes above which `write`/`edit` automatically run in the background (`async_mode`). Default: `262144` |
 | `log_level` | No | Log level: `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`. Default: `INFO` |
 
 ### 4. Smoke-test the connection
@@ -253,6 +254,7 @@ uv run python scripts/probe_login.py
 uv run python scripts/probe_projects.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_mcp_tools.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py
+OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_async_write.py
 OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_compile_roundtrip.py
 ```
 
@@ -336,6 +338,49 @@ then this repository is built for that exact use case.
 - confirm the target path is a `doc`, not a binary `fileRef`
 - if your instance is heavily customized, validate write behavior with
   `OVERLEAF_PROJECT_ID=<project-id> uv run python scripts/test_write_roundtrip.py`
+
+### `-32001` / `Request timed out` on large writes
+
+`-32001` is raised by the **MCP client**, not this server. A full `write` of a
+large document is inherently slower than a targeted `edit` because the server
+must download the current snapshot, compute a diff, and send the OT update over
+the realtime channel.
+
+- Since v0.1.0 the server mitigates this: content above
+  `async_write_threshold_bytes` (default 256 KB) automatically runs **in the
+  background**, and the tool returns a `job_id` immediately.
+- In OpenCode the `mcp.<name>.timeout` option only affects *fetching the tool
+  list*, not individual tool calls, so a longer timeout there does **not**
+  fix tool-call timeouts. Check your client's request-timeout setting.
+- Practical mitigations:
+  - prefer `edit` (minimal diffs) over `write` for incremental changes
+  - split very large content into smaller `write`/`edit` calls
+  - raise `timeout_seconds` in `~/.config/sharelatex-mcp/config.json` (default
+    `60`) if your Overleaf host or network is slow
+  - pass `async_mode=true` explicitly (or accept the automatic threshold) and
+    poll `get_job_status` / `wait_job` for the result
+- `read` with `offset`/`limit` still transfers the full document over the
+  realtime channel before slicing; it does not make large reads cheaper.
+
+### Background (async) writes
+
+`write`/`edit` accept an optional `async_mode` parameter:
+
+- `async_mode=true` — queue the operation in the background and return a
+  `job_id` immediately. Poll `get_job_status(job_id)` until the status is
+  `succeeded` (the result is in `result`) or `failed` (in `error`), or call
+  `wait_job(job_id, timeout_seconds)` to block until it finishes.
+- `async_mode=false` — force synchronous execution (may hit a client timeout
+  for very large content).
+- omitted — automatic: runs in the background when the content is larger than
+  `async_write_threshold_bytes`.
+
+```jsonc
+// write > 256 KB → returns a job_id
+{ "job_id": "...", "status": "queued", "async": true }
+// get_job_status → eventually
+{ "job_id": "...", "status": "succeeded", "result": { "changed": true, "path": "/main.tex" } }
+```
 
 ## 🤝 Contributing
 

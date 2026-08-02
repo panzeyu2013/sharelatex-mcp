@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -21,12 +22,15 @@ TEMPLATE = """\
   "email": "your-email@example.com",
   // Login password
   "password": "your-password",
-  // HTTP request timeout in seconds (default: 15)
-  "timeout_seconds": 15,
+  // HTTP request / WebSocket timeout in seconds (default: 60)
+  "timeout_seconds": 60,
   // Set to true if you are using http:// instead of https://
   "allow_insecure_http": false,
   // Optional project id used by destructive local validation scripts
   "project_id": null,
+  // Content size in bytes above which write/edit automatically run in the
+  // background (async_mode) to avoid client request timeouts (default: 262144)
+  "async_write_threshold_bytes": 262144,
   // Log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
   "log_level": "INFO"
 }
@@ -42,6 +46,7 @@ class AppConfig:
     allow_insecure_http: bool
     project_id: str | None
     log_level: LogLevel
+    async_write_threshold_bytes: int = 262144
 
 
 def _strip_json_comments(text: str) -> str:
@@ -129,10 +134,25 @@ def load_config() -> AppConfig:
         if project_id is not None:
             project_id = validate_project_id(project_id)
 
-    timeout_seconds = data.get("timeout_seconds", 15)
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or timeout_seconds < 1:
+    timeout_seconds = data.get("timeout_seconds", 60)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds < 1
+    ):
         raise RuntimeError("timeout_seconds must be a number >= 1")
     timeout_seconds = int(timeout_seconds)
+
+    async_write_threshold_bytes = data.get("async_write_threshold_bytes", 262144)
+    if (
+        isinstance(async_write_threshold_bytes, bool)
+        or not isinstance(async_write_threshold_bytes, (int, float))
+        or not math.isfinite(async_write_threshold_bytes)
+        or async_write_threshold_bytes < 0
+    ):
+        raise RuntimeError("async_write_threshold_bytes must be a number >= 0")
+    async_write_threshold_bytes = int(async_write_threshold_bytes)
 
     raw_log_level = data.get("log_level", "INFO")
     if not isinstance(raw_log_level, str):
@@ -150,5 +170,6 @@ def load_config() -> AppConfig:
         timeout_seconds=timeout_seconds,
         allow_insecure_http=allow_insecure_http,
         project_id=project_id,
+        async_write_threshold_bytes=async_write_threshold_bytes,
         log_level=typed_log_level,
     )
